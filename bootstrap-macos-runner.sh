@@ -23,6 +23,7 @@ IOS_RUNTIME_DMG_PATH="${IOS_RUNTIME_DMG_PATH:-}"
 ADDITIONAL_XCODE_VERSION="26.0"
 ADDITIONAL_IOS_SIM_RUNTIME_NAME="iOS 26.0"
 ADDITIONAL_SIM_DEVICE_TYPE="iPhone 17 Pro"
+CI_ADDITIONAL_SIM_NAME="CI iPhone 17 Pro (26.0)"
 
 # ==================================================
 # Helpers
@@ -251,8 +252,13 @@ log "Resetting CoreSimulatorService after Xcode version switch..."
 sudo killall -9 com.apple.CoreSimulator.CoreSimulatorService 2>/dev/null || true
 sleep 2
 
-# --- Simulator runtime for additional Xcode ---
-log "Ensuring simulator runtime '${ADDITIONAL_IOS_SIM_RUNTIME_NAME}' for Xcode ${ADDITIONAL_XCODE_VERSION}..."
+# --- Simulator runtime + device for additional Xcode ---
+log "Ensuring simulator runtime '${ADDITIONAL_IOS_SIM_RUNTIME_NAME}' and device '${CI_ADDITIONAL_SIM_NAME}' exist..."
+
+# Ensure the device type exists in this Xcode
+if ! xcrun simctl list devicetypes | grep -Fq "${ADDITIONAL_SIM_DEVICE_TYPE}"; then
+  die "Simulator device type '${ADDITIONAL_SIM_DEVICE_TYPE}' not found in Xcode ${ADDITIONAL_XCODE_VERSION}. Check Xcode version/components."
+fi
 
 get_additional_runtime_id() {
   xcrun simctl list runtimes \
@@ -277,6 +283,14 @@ if [[ -z "${additional_runtime_id}" ]]; then
     set +e
     xcodes runtimes install "${ADDITIONAL_IOS_SIM_RUNTIME_NAME}"
     set -e
+    additional_runtime_id="$(get_additional_runtime_id)"
+  fi
+
+  # Last resort: local DMG
+  if [[ -z "${additional_runtime_id}" && -n "${IOS_RUNTIME_DMG_PATH}" ]]; then
+    log "Trying simctl runtime add from DMG: ${IOS_RUNTIME_DMG_PATH}"
+    [[ -f "${IOS_RUNTIME_DMG_PATH}" ]] || die "IOS_RUNTIME_DMG_PATH does not exist: ${IOS_RUNTIME_DMG_PATH}"
+    xcrun simctl runtime add "${IOS_RUNTIME_DMG_PATH}"
     additional_runtime_id="$(get_additional_runtime_id)"
   fi
 fi
