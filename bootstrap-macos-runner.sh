@@ -25,6 +25,9 @@ ADDITIONAL_IOS_SIM_RUNTIME_NAME="iOS 26.0"
 ADDITIONAL_SIM_DEVICE_TYPE="iPhone 17 Pro"
 CI_ADDITIONAL_SIM_NAME="CI iPhone 17 Pro (26.0)"
 
+# Additional Node.js (installed alongside the default, NOT selected as default)
+ADDITIONAL_NODE_VERSION="24.16.0"
+
 # ==================================================
 # Helpers
 # ==================================================
@@ -358,6 +361,27 @@ fi
 log "Node OK: ${ACTUAL_NODE_VERSION}"
 
 # ==================================================
+# Additional Node.js (installed alongside, NOT the default)
+# ==================================================
+log "Ensuring additional Node ${ADDITIONAL_NODE_VERSION} is installed..."
+
+ADDITIONAL_NODE_BIN="${NVM_DIR}/versions/node/v${ADDITIONAL_NODE_VERSION}/bin/node"
+if [[ -x "${ADDITIONAL_NODE_BIN}" ]]; then
+  log "Node ${ADDITIONAL_NODE_VERSION} already installed — skipping"
+else
+  log "Installing Node ${ADDITIONAL_NODE_VERSION}..."
+  # --no-use: install without switching this shell's active version away from
+  # the pinned default set above.
+  nvm install "${ADDITIONAL_NODE_VERSION}" --no-use
+fi
+
+[[ -x "${ADDITIONAL_NODE_BIN}" ]] || die "Additional Node install failed: binary not found at ${ADDITIONAL_NODE_BIN}"
+ACTUAL_ADDITIONAL_NODE_VERSION="$("${ADDITIONAL_NODE_BIN}" -v | sed 's/^v//')"
+[[ "${ACTUAL_ADDITIONAL_NODE_VERSION}" == "${ADDITIONAL_NODE_VERSION}" ]] \
+  || die "Additional Node version mismatch: expected ${ADDITIONAL_NODE_VERSION}, got ${ACTUAL_ADDITIONAL_NODE_VERSION}"
+log "Additional Node OK: ${ACTUAL_ADDITIONAL_NODE_VERSION} (default remains ${REQUIRED_NODE_VERSION}; run 'nvm use ${ADDITIONAL_NODE_VERSION}' to switch)"
+
+# ==================================================
 # 3) applesimutils (MUST be before Ruby)
 # ==================================================
 log "Ensuring applesimutils..."
@@ -448,7 +472,8 @@ cat <<EOF
 Locked versions:
 - Xcode (default) : ${ACTUAL_XCODE_VERSION}
 - Xcode (extra)   : ${ADDITIONAL_XCODE_VERSION} (${ADDITIONAL_XCODE_APP})
-- Node            : ${ACTUAL_NODE_VERSION}
+- Node (default)  : ${ACTUAL_NODE_VERSION}
+- Node (extra)    : ${ACTUAL_ADDITIONAL_NODE_VERSION}
 - Ruby            : ${ACTUAL_RUBY_VERSION}
 - CocoaPods       : ${ACTUAL_COCOAPODS_VERSION}
 - applesimutils   : $(applesimutils --version 2>/dev/null || echo "installed")

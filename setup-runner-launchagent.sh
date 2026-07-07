@@ -94,7 +94,19 @@ log "Uninstalling any previous LaunchAgent..."
 # --------------------------------------------------------------------------
 # The runner reads .path (not shell profiles) to set its PATH at startup.
 # Build the ideal PATH and write it so the runner can find rbenv Ruby, node, etc.
-DESIRED_PATH="${HOME}/.rbenv/shims:${HOME}/.rbenv/bin:${HOME}/.nvm/versions/node/$(ls -1 "${HOME}/.nvm/versions/node/" 2>/dev/null | tail -1)/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+#
+# Resolve the nvm *default* alias explicitly rather than taking the
+# lexically-last entry under versions/node: bootstrap-macos-runner.sh installs
+# additional (non-default) Node versions alongside the pinned default, and a
+# newer additional version (e.g. v24.16.0) would otherwise sort after the
+# pinned default (e.g. v22.12.0) and get picked instead.
+NVM_DEFAULT_ALIAS_FILE="$HOME/.nvm/alias/default"
+[[ -f "${NVM_DEFAULT_ALIAS_FILE}" ]] || die "nvm default alias not found at ${NVM_DEFAULT_ALIAS_FILE} — run bootstrap-macos-runner.sh first"
+NVM_DEFAULT_NODE_VERSION="$(cat "${NVM_DEFAULT_ALIAS_FILE}")"
+NODE_DEFAULT_BIN_DIR="$HOME/.nvm/versions/node/v${NVM_DEFAULT_NODE_VERSION}/bin"
+[[ -d "${NODE_DEFAULT_BIN_DIR}" ]] || die "Default Node version directory not found: ${NODE_DEFAULT_BIN_DIR}"
+
+DESIRED_PATH="${HOME}/.rbenv/shims:${HOME}/.rbenv/bin:${NODE_DEFAULT_BIN_DIR}:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 log "Writing .path for runner service..."
 echo "${DESIRED_PATH}" > "${RUNNER_DIR}/.path"
 log "Runner PATH: $(cat "${RUNNER_DIR}/.path")"
