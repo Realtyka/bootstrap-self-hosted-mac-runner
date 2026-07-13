@@ -2,6 +2,8 @@
 
 This script provisions a fresh macOS machine as a GitHub Actions self-hosted runner. It installs and pins Homebrew, Xcode, iOS simulator runtimes, Node.js (via NVM), Ruby (via rbenv), and CocoaPods to exact versions required by the project. The script is idempotent — if it fails mid-way or is run again, it skips steps that are already complete.
 
+Xcode and Node.js are each installed in two versions: a pinned default, plus an additional version installed alongside (not selected as default). This lets workflows that pin an older toolchain and workflows migrating to a newer one both run on the same runner during a transition period.
+
 ### Prerequisites
 
 If Xcode is not already installed, the script uses [xcodes](https://github.com/XcodesOrg/xcodes) to download and install it. This requires an Apple ID. Export the following environment variables before running the script:
@@ -19,7 +21,8 @@ If Xcode is already installed at the required version, these variables are not n
 |------|---------|
 | Xcode (default) | 16.4 |
 | Xcode (extra) | 26.0 (installed alongside, not default) |
-| Node.js | 22.12.0 |
+| Node.js (default) | 22.12.0 |
+| Node.js (extra) | 24.16.0 (installed alongside, not default) |
 | Ruby | 3.1.2 |
 | CocoaPods | 1.16.2 |
 | iOS Simulator | iOS 18.6 (iPhone 16 Pro) |
