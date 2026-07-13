@@ -96,10 +96,15 @@ log "Uninstalling any previous LaunchAgent..."
 # Build the ideal PATH and write it so the runner can find rbenv Ruby, node, etc.
 #
 # Resolve the nvm *default* alias explicitly rather than taking the
-# lexically-last entry under versions/node: bootstrap-macos-runner.sh installs
-# additional (non-default) Node versions alongside the pinned default, and a
-# newer additional version (e.g. v24.16.0) would otherwise sort after the
-# pinned default (e.g. v22.12.0) and get picked instead.
+# lexically-last entry under versions/node: a box bootstrapped previously can
+# still carry Node versions from an earlier pin, and one of those would
+# otherwise sort ahead of the current default and get picked instead.
+#
+# Note the corepack `yarn` shim lives in Homebrew's bin, not here — see the
+# Corepack section of bootstrap-macos-runner.sh. Both dirs must stay on .path:
+# actions/setup-node only prepends its own tool-cache Node bin dir, so a
+# `cache: yarn` lookup falls through to Homebrew's bin and resolves there
+# whatever Node version .nvmrc pins.
 NVM_DEFAULT_ALIAS_FILE="$HOME/.nvm/alias/default"
 [[ -f "${NVM_DEFAULT_ALIAS_FILE}" ]] || die "nvm default alias not found at ${NVM_DEFAULT_ALIAS_FILE} — run bootstrap-macos-runner.sh first"
 NVM_DEFAULT_NODE_VERSION="$(cat "${NVM_DEFAULT_ALIAS_FILE}")"

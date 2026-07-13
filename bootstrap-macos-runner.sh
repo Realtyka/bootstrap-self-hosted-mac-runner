@@ -5,7 +5,7 @@ set -euo pipefail
 # REQUIRED VERSIONS (FAIL IF NOT EXACT)
 # ==================================================
 REQUIRED_XCODE_VERSION="16.4"
-REQUIRED_NODE_VERSION="22.12.0"
+REQUIRED_NODE_VERSION="24.16.0"
 REQUIRED_RUBY_VERSION="3.1.2"
 REQUIRED_COCOAPODS_VERSION="1.16.2"
 NVM_VERSION="v0.40.4"
@@ -24,9 +24,6 @@ ADDITIONAL_XCODE_VERSION="26.0"
 ADDITIONAL_IOS_SIM_RUNTIME_NAME="iOS 26.0"
 ADDITIONAL_SIM_DEVICE_TYPE="iPhone 17 Pro"
 CI_ADDITIONAL_SIM_NAME="CI iPhone 17 Pro (26.0)"
-
-# Additional Node.js (installed alongside the default, NOT selected as default)
-ADDITIONAL_NODE_VERSION="24.16.0"
 
 # ==================================================
 # Helpers
@@ -361,25 +358,28 @@ fi
 log "Node OK: ${ACTUAL_NODE_VERSION}"
 
 # ==================================================
-# Additional Node.js (installed alongside, NOT the default)
+# Corepack (yarn shim)
 # ==================================================
-log "Ensuring additional Node ${ADDITIONAL_NODE_VERSION} is installed..."
+# actions/setup-node resolves Node from the runner's tool cache, never from nvm,
+# and `cache: yarn` looks up `yarn` on PATH inside its own step — before a
+# workflow's own `corepack enable` step gets a chance to run. setup-node only
+# *prepends* the tool-cache bin dir, so the lookup falls through to the rest of
+# PATH and finds the shim below. The shim then execs under whichever Node
+# setup-node activated, and resolves the yarn version from the repo's own
+# packageManager field — so .nvmrc stays the single source of truth for Node.
+#
+# The shim goes in Homebrew's bin rather than the nvm bin dir on purpose: that
+# path is already on the runner's .path (setup-runner-launchagent.sh) and does
+# not move when the Node pin changes, so bumping REQUIRED_NODE_VERSION never
+# strands the shim outside the runner's PATH.
+COREPACK_SHIM_DIR="$(brew --prefix)/bin"
+log "Enabling Corepack (shims -> ${COREPACK_SHIM_DIR})..."
 
-ADDITIONAL_NODE_BIN="${NVM_DIR}/versions/node/v${ADDITIONAL_NODE_VERSION}/bin/node"
-if [[ -x "${ADDITIONAL_NODE_BIN}" ]]; then
-  log "Node ${ADDITIONAL_NODE_VERSION} already installed — skipping"
-else
-  log "Installing Node ${ADDITIONAL_NODE_VERSION}..."
-  # --no-use: install without switching this shell's active version away from
-  # the pinned default set above.
-  nvm install "${ADDITIONAL_NODE_VERSION}" --no-use
-fi
+corepack enable --install-directory "${COREPACK_SHIM_DIR}"
 
-[[ -x "${ADDITIONAL_NODE_BIN}" ]] || die "Additional Node install failed: binary not found at ${ADDITIONAL_NODE_BIN}"
-ACTUAL_ADDITIONAL_NODE_VERSION="$("${ADDITIONAL_NODE_BIN}" -v | sed 's/^v//')"
-[[ "${ACTUAL_ADDITIONAL_NODE_VERSION}" == "${ADDITIONAL_NODE_VERSION}" ]] \
-  || die "Additional Node version mismatch: expected ${ADDITIONAL_NODE_VERSION}, got ${ACTUAL_ADDITIONAL_NODE_VERSION}"
-log "Additional Node OK: ${ACTUAL_ADDITIONAL_NODE_VERSION} (default remains ${REQUIRED_NODE_VERSION}; run 'nvm use ${ADDITIONAL_NODE_VERSION}' to switch)"
+YARN_SHIM="${COREPACK_SHIM_DIR}/yarn"
+[[ -x "${YARN_SHIM}" ]] || die "Corepack enable failed: yarn shim not found at ${YARN_SHIM}"
+log "Corepack OK: yarn shim at ${YARN_SHIM}"
 
 # ==================================================
 # 3) applesimutils (MUST be before Ruby)
@@ -472,8 +472,8 @@ cat <<EOF
 Locked versions:
 - Xcode (default) : ${ACTUAL_XCODE_VERSION}
 - Xcode (extra)   : ${ADDITIONAL_XCODE_VERSION} (${ADDITIONAL_XCODE_APP})
-- Node (default)  : ${ACTUAL_NODE_VERSION}
-- Node (extra)    : ${ACTUAL_ADDITIONAL_NODE_VERSION}
+- Node            : ${ACTUAL_NODE_VERSION}
+- Yarn (corepack) : ${YARN_SHIM}
 - Ruby            : ${ACTUAL_RUBY_VERSION}
 - CocoaPods       : ${ACTUAL_COCOAPODS_VERSION}
 - applesimutils   : $(applesimutils --version 2>/dev/null || echo "installed")
