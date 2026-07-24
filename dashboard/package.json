@@ -5,8 +5,11 @@
   "type": "module",
   "scripts": {
     "dev": "tsx watch src/server/index.ts",
+    "dev:web": "vite",
     "test": "vitest run",
-    "build": "tsc -p ."
+    "typecheck": "tsc -p . --noEmit && tsc -p tsconfig.web.json",
+    "build": "tsc -p . && vite build",
+    "start": "node dist/server/index.js"
   },
   "dependencies": {
     "@aws-sdk/client-s3": "^3.1095.0",

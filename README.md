@@ -1,5 +1,9 @@
 ## Bootstrap a macOS self-hosted runner
 
+> **Fleet dashboard:** see [dashboard/](dashboard/) for a local web UI that
+> onboards fresh bare metals, runs these scripts across the whole fleet in
+> parallel with live logs, and monitors version drift.
+
 This script provisions a fresh macOS machine as a GitHub Actions self-hosted runner. It installs and pins Homebrew, Xcode, iOS simulator runtimes, Node.js (via NVM), Ruby (via rbenv), and CocoaPods to exact versions required by the project. The script is idempotent — if it fails mid-way or is run again, it skips steps that are already complete.
 
 Xcode and Node.js are each installed in two versions: a pinned default, plus an additional version installed alongside (not selected as default). This lets workflows that pin an older toolchain and workflows migrating to a newer one both run on the same runner during a transition period.

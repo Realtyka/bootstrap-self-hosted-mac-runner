@@ -1,11 +1,12 @@
 import Database from 'better-sqlite3';
 import { appendFileSync, mkdirSync } from 'node:fs';
-import { join } from 'node:path';
+import { join, dirname } from 'node:path';
 import type { Job } from './types.js';
 
 export class Store {
   private db: Database.Database;
   constructor(dbPath: string, private logDir: string) {
+    if (dbPath !== ':memory:') mkdirSync(dirname(dbPath), { recursive: true });
     this.db = new Database(dbPath);
     mkdirSync(logDir, { recursive: true });
     this.db.exec(`
