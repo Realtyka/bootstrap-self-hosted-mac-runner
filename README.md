@@ -6,27 +6,33 @@ Xcode and Node.js are each installed in two versions: a pinned default, plus an 
 
 ### Prerequisites
 
-If Xcode is not already installed, the script uses [xcodes](https://github.com/XcodesOrg/xcodes) to download and install it. This requires an Apple ID. Export the following environment variables before running the script:
+**Preferred (no Apple auth):** provide a URL to `Xcode_26.0.xip` — for example a presigned S3 URL. The [fleet dashboard](dashboard/) sets this automatically for every bootstrap job:
+
+```bash
+export XCODE_XIP_URL="https://<presigned-s3-url>/Xcode_26.0.xip"
+```
+
+`xip --expand` verifies Apple's signature on the archive, so no Apple ID ever touches the machine. Simulator runtimes are fetched with `xcodebuild -downloadPlatform iOS`, which also needs no Apple ID.
+
+**Fallback:** if `XCODE_XIP_URL` is unset, the script uses [xcodes](https://github.com/XcodesOrg/xcodes), which requires an Apple ID (and may prompt for a 2FA code interactively):
 
 ```bash
 export XCODE_APPLE_ID="your@apple.id"
 export XCODE_APPLE_ID_PASSWORD="your-apple-id-password"  # your regular Apple ID password
 ```
 
-If Xcode is already installed at the required version, these variables are not needed.
+If Xcode is already installed at the required version, neither is needed.
 
 ### Pinned versions
 
 | Tool | Version |
 |------|---------|
-| Xcode (default) | 16.4 |
-| Xcode (extra) | 26.0 (installed alongside, not default) |
+| Xcode | 26.0 |
 | Node.js | 24.16.0 |
 | Yarn | via Corepack shim (version comes from each repo's `packageManager`) |
 | Ruby | 3.1.2 |
 | CocoaPods | 1.16.2 |
-| iOS Simulator | iOS 18.6 (iPhone 16 Pro) |
-| iOS Simulator (extra) | iOS 26.0 (iPhone 17 Pro) |
+| iOS Simulator | iOS 26.0 (iPhone 17 Pro) |
 
 ### Usage
 

@@ -1,4 +1,5 @@
 import { describe, it, expect } from 'vitest';
+import { readFileSync } from 'node:fs';
 import { parsePins } from '../src/server/pins.js';
 
 const header = `
@@ -19,5 +20,10 @@ describe('parsePins', () => {
   });
   it('throws when a pin is missing', () => {
     expect(() => parsePins('REQUIRED_XCODE_VERSION="26.0"')).toThrow(/REQUIRED_NODE_VERSION/);
+  });
+  it('parses pins from the real bootstrap script', () => {
+    const real = readFileSync(new URL('../../bootstrap-macos-runner.sh', import.meta.url), 'utf8');
+    expect(parsePins(real).xcode).toBe('26.0');
+    expect(parsePins(real).simDevice).toBe('iPhone 17 Pro');
   });
 });
