@@ -26,9 +26,8 @@ your local AWS credentials — runners never see AWS creds or an Apple ID.
 
 ```bash
 npm run build && npm start           # production: http://127.0.0.1:4400
-# or during development:
-npm run dev                          # api server on :4400
-npm run dev:web                      # vite dev server on :5173 (proxies /api)
+# or during development (runs api server on :4400 + vite on :5173 together):
+npm run dev                          # open http://localhost:5173
 ```
 
 ## Onboarding a fresh bare metal
