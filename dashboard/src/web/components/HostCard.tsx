@@ -27,10 +27,12 @@ function ago(ts: number): string {
   return m < 1 ? 'just now' : m < 60 ? `${m}m ago` : `${Math.round(m / 60)}h ago`;
 }
 
-function VersionLine({ label, value, bad }: { label: string; value: string | null; bad?: boolean }) {
+function VersionLine({ label, value, drift }: { label: string; value: string | null; drift?: string }) {
+  // drift string looks like "xcode: want 26.0, got 16.4" — surface the expected version
+  const want = drift?.match(/want ([^,]+)/)?.[1];
   return (
-    <span className={cn('whitespace-nowrap', bad ? 'text-red-600 font-medium' : 'text-muted-foreground')}>
-      {label} {value ?? '—'}{bad ? ' ✗' : ' ✓'}
+    <span className={cn('whitespace-nowrap', drift ? 'text-red-600 font-medium' : 'text-muted-foreground')}>
+      {label} {value ?? '—'}{drift ? ` ✗ (want ${want})` : ' ✓'}
     </span>
   );
 }
@@ -68,10 +70,10 @@ export function HostCard({ v, selected, onToggle, onOpenHistory, lastLogLine }: 
         {h && h.reachable && (
           <>
             <p className="flex flex-wrap gap-x-3 gap-y-0.5">
-              <VersionLine label="Xcode" value={h.versions.xcode} bad={!!driftFor('xcode')} />
-              <VersionLine label="Node" value={h.versions.node} bad={!!driftFor('node')} />
-              <VersionLine label="Ruby" value={h.versions.ruby} bad={!!driftFor('ruby')} />
-              <VersionLine label="Pods" value={h.versions.cocoapods} bad={!!driftFor('cocoapods')} />
+              <VersionLine label="Xcode" value={h.versions.xcode} drift={driftFor('xcode')} />
+              <VersionLine label="Node" value={h.versions.node} drift={driftFor('node')} />
+              <VersionLine label="Ruby" value={h.versions.ruby} drift={driftFor('ruby')} />
+              <VersionLine label="Pods" value={h.versions.cocoapods} drift={driftFor('cocoapods')} />
             </p>
             <p className="flex flex-wrap gap-x-3 text-muted-foreground">
               <span>disk {h.diskFreeGb ?? '—'}G</span>

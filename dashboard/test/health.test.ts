@@ -33,6 +33,12 @@ describe('probeHost', () => {
     expect(r.drift).toEqual([]);
     expect(r.runnerListening).toBe(true);
   });
+  it('flags a 16.4 machine as drifted from the 26.0 pin', async () => {
+    const old = okOutput.replace('XCODE=26.0', 'XCODE=16.4');
+    const r = await probeHost(fakeT({ stdout: old }), 'a@b', pins);
+    expect(r.versions.xcode).toBe('16.4');
+    expect(r.drift).toContain('xcode: want 26.0, got 16.4');
+  });
   it('flags version drift and missing sudo', async () => {
     const bad = okOutput.replace('NODE=22.12.0', 'NODE=20.11.0').replace('SUDO=ok', 'SUDO=no');
     const r = await probeHost(fakeT({ stdout: bad }), 'a@b', pins);
