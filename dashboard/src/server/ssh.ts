@@ -1,7 +1,10 @@
 import { spawn } from 'node:child_process';
 
 export interface ExecResult { code: number; stdout: string; stderr: string }
-export const SSH_BASE_ARGS = ['-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10'];
+// accept-new: trust a host key on first contact (fresh bare metals are not in
+// known_hosts yet; BatchMode would otherwise fail closed), but still refuse
+// if a known host's key changes.
+export const SSH_BASE_ARGS = ['-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10', '-o', 'StrictHostKeyChecking=accept-new'];
 
 export function buildSshArgs(sshDest: string, command: string): string[] {
   return [...SSH_BASE_ARGS, sshDest, command];

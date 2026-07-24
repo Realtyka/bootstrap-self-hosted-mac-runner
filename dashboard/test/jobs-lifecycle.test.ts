@@ -66,19 +66,36 @@ describe('lifecycle', () => {
     const log = readFileSync(store.logPath(job.id), 'utf8');
     expect(log).toContain('got:sekret');
   });
-  it('reattachAll finalizes a job that finished while app was down', async () => {
-    writeFileSync(join(repoRoot, 'bootstrap-macos-runner.sh'), 'exit 0');
+  it('reattachAll finalizes a finished job without duplicating the log mirror', async () => {
+    writeFileSync(join(repoRoot, 'bootstrap-macos-runner.sh'), 'echo one; echo two; exit 0');
     const job = await engine.startJob({ host, action: 'bootstrap', source: 'local' });
     await until(() => store.getJob(job.id)?.state === 'passed');
+    const before = readFileSync(store.logPath(job.id), 'utf8');
     store.updateJob(job.id, { state: 'running', exitCode: null, finishedAt: null });
     await engine.reattachAll([host]);
     await until(() => store.getJob(job.id)?.state === 'passed');
+    await wait(200);
+    expect(readFileSync(store.logPath(job.id), 'utf8')).toBe(before);
   });
-  it('killJob terminates and marks killed', async () => {
+  it('refuses a second job while one is running on the host', async () => {
+    writeFileSync(join(repoRoot, 'bootstrap-macos-runner.sh'), 'sleep 30');
+    const job = await engine.startJob({ host, action: 'bootstrap', source: 'local' });
+    await expect(engine.startJob({ host, action: 'bootstrap', source: 'local' }))
+      .rejects.toThrow(/already running/);
+    await engine.killJob(job.id, host.sshDest);
+  });
+  it('killJob terminates the script process tree and marks killed', async () => {
     writeFileSync(join(repoRoot, 'bootstrap-macos-runner.sh'), 'echo waiting; sleep 60');
     const job = await engine.startJob({ host, action: 'bootstrap', source: 'local' });
-    await wait(200);
+    const pidFile = join(fakeHome, '.mac-fleet', 'jobs', job.id, 'script_pid');
+    await until(() => {
+      try { return readFileSync(pidFile, 'utf8').trim() !== ''; } catch { return false; }
+    });
+    const scriptPid = Number(readFileSync(pidFile, 'utf8').trim());
     await engine.killJob(job.id, host.sshDest);
     expect(store.getJob(job.id)?.state).toBe('killed');
+    await until(() => {
+      try { process.kill(scriptPid, 0); return false; } catch { return true; }  // ESRCH = dead
+    });
   });
 });

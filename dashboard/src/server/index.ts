@@ -53,15 +53,18 @@ if (existsSync(join(webDist, 'index.html'))) {
 await engine.reattachAll(loadHosts(cfg.hostsPath));
 
 async function probeAll() {
-  for (const h of loadHosts(cfg.hostsPath)) {
+  await Promise.all(loadHosts(cfg.hostsPath).map(async h => {
     try {
       const report = await probeHost(transport, h.sshDest, pins);
       store.saveHealth(h.name, JSON.stringify(report), report.checkedAt);
     } catch { /* host probe failures are reflected as unreachable on next success */ }
-  }
+  }));
 }
-void probeAll();
-setInterval(probeAll, cfg.probeIntervalMs);
+// Chained (not setInterval) so a slow cycle never overlaps the next one
+function scheduleProbes() {
+  void probeAll().finally(() => setTimeout(scheduleProbes, cfg.probeIntervalMs));
+}
+scheduleProbes();
 
 await app.listen({ port: cfg.port, host: '127.0.0.1' });
 console.log(`mac-fleet dashboard: http://127.0.0.1:${cfg.port}`);

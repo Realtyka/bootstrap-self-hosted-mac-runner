@@ -4,7 +4,7 @@ import { SystemSshTransport, buildSshArgs } from '../src/server/ssh.js';
 describe('buildSshArgs', () => {
   it('includes batch mode, timeout, dest, command — no -t', () => {
     const args = buildSshArgs('administrator@10.0.0.1', 'echo hi');
-    expect(args).toEqual(['-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10', 'administrator@10.0.0.1', 'echo hi']);
+    expect(args).toEqual(['-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10', '-o', 'StrictHostKeyChecking=accept-new', 'administrator@10.0.0.1', 'echo hi']);
     expect(args).not.toContain('-t');
   });
 });

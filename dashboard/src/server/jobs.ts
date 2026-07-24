@@ -1,5 +1,6 @@
 import { EventEmitter } from 'node:events';
 import { randomUUID } from 'node:crypto';
+import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import type { Transport } from './ssh.js';
 import type { Store } from './store.js';
@@ -17,13 +18,19 @@ export interface JobEngineOpts {
   pollMs?: number; stallMs?: number;
 }
 
+// set -m puts script.sh in its own process group (pgid == its pid), so killJob
+// can signal the whole tree (curl, xip, xcodebuild descendants) with kill -- -pgid.
 const JOB_SH = `#!/bin/bash
 cd "$(dirname "$0")"
 mkfifo stdin.pipe 2>/dev/null || true
 exec 3<>stdin.pipe
 if [ -f env ]; then . ./env; rm -f env; fi
 export NONINTERACTIVE=1
-bash script.sh <&3
+set -m
+bash script.sh <&3 &
+SCRIPT_PID=$!
+echo "$SCRIPT_PID" > script_pid
+wait "$SCRIPT_PID"
 echo $? > exit_code
 `;
 
@@ -43,6 +50,9 @@ export class JobEngine extends EventEmitter {
 
   async startJob(p: { host: Host; action: JobAction; source: JobSource; envVars?: Record<string, string> }): Promise<Job> {
     const { host, action, source } = p;
+    if (this.store.runningJobs().some(j => j.host === host.name)) {
+      throw new JobRefusedError('a job is already running on this host');
+    }
     const pre = await this.t.exec(host.sshDest, 'sudo -n true');
     if (pre.code !== 0) throw new JobRefusedError('passwordless sudo missing — re-run onboarding');
 
@@ -88,7 +98,10 @@ export class JobEngine extends EventEmitter {
   attach(job: Job, sshDest: string): void {
     const d = this.dir(job.id);
     this.lastLineAt.set(job.id, Date.now());
-    const tail = this.t.stream(sshDest, `tail -n +1 -F ${d}/out.log 2>/dev/null`, line => {
+    // Resume past lines already mirrored locally so a reattach never duplicates output
+    let mirrored = 0;
+    try { mirrored = readFileSync(this.store.logPath(job.id), 'utf8').split('\n').filter(Boolean).length; } catch { /* no mirror yet */ }
+    const tail = this.t.stream(sshDest, `tail -n +${mirrored + 1} -F ${d}/out.log 2>/dev/null`, line => {
       this.lastLineAt.set(job.id, Date.now());
       this.store.appendLog(job.id, line);
       const cur = this.store.getJob(job.id);
@@ -130,6 +143,14 @@ export class JobEngine extends EventEmitter {
     for (const job of this.store.runningJobs()) {
       const host = byName.get(job.host);
       if (!host) continue;
+      // Job may have finished while the app was down — finalize without tailing
+      const r = await this.t.exec(host.sshDest, `cat ${this.dir(job.id)}/exit_code 2>/dev/null`);
+      if (r.code === 0 && r.stdout.trim() !== '') {
+        const code = Number(r.stdout.trim());
+        this.store.updateJob(job.id, { state: code === 0 ? 'passed' : 'failed', exitCode: code, finishedAt: Date.now() });
+        this.emit('state', this.store.getJob(job.id));
+        continue;
+      }
       this.attach(job, host.sshDest);
     }
   }
@@ -141,9 +162,11 @@ export class JobEngine extends EventEmitter {
 
   async killJob(jobId: string, hostDest: string): Promise<void> {
     const d = this.dir(jobId);
-    await this.t.exec(hostDest, `kill $(cat ${d}/pid) 2>/dev/null; pkill -f "jobs/${jobId}/script.sh" 2>/dev/null; true`);
+    // Mark killed before signalling so the poller can't race in a failed/passed state
     this.store.updateJob(jobId, { state: 'killed', finishedAt: Date.now() });
     this.emit('state', this.store.getJob(jobId));
     this.detach(jobId);
+    // script.sh runs in its own process group (set -m in job.sh): -pgid takes the whole tree
+    await this.t.exec(hostDest, `kill -TERM -- -$(cat ${d}/script_pid) 2>/dev/null; kill $(cat ${d}/pid) 2>/dev/null; true`);
   }
 }
