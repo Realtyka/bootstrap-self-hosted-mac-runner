@@ -1,8 +1,8 @@
-import type { Host, Job, JobAction, JobSource } from '../../server/types.js';
+import type { Host, Job, JobAction, JobSource, JobState } from '../../server/types.js';
 import type { HealthReport } from '../../server/health.js';
 import type { OnboardStep } from '../../server/onboarding.js';
 
-export type { Host, Job, JobAction, JobSource, HealthReport, OnboardStep };
+export type { Host, Job, JobAction, JobSource, JobState, HealthReport, OnboardStep };
 
 export interface HostView { host: Host; health: (HealthReport & { checkedAt: number }) | null; runningJob: Job | null }
 export interface StartJobsResult { started: Job[]; refused: { host: string; reason: string }[] }

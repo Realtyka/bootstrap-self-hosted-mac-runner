@@ -1,9 +1,11 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useReducer, useState } from 'react';
 import { api, type HostView, type Job, type JobSource } from './lib/api';
 import { useEvents } from './lib/useEvents';
 import { toggle, selectAll, clear, eligible } from './lib/selection';
+import { dockReducer, emptyDock } from './lib/dock';
 import { HostCard } from './components/HostCard';
 import { Toolbar } from './components/Toolbar';
+import { LogDock } from './components/LogDock';
 
 export default function App() {
   const [views, setViews] = useState<HostView[]>([]);
@@ -11,26 +13,32 @@ export default function App() {
   const [source, setSource] = useState<JobSource>('github');
   const [busy, setBusy] = useState(false);
   const [lastLine, setLastLine] = useState<Record<string, string>>({});
-  const [jobHost, setJobHost] = useState<Record<string, string>>({});
+  const [dock, dispatch] = useDock();
 
-  const reload = useCallback(() => api.hosts().then(v => {
-    setViews(v);
-    setJobHost(prev => {
-      const next = { ...prev };
-      for (const view of v) if (view.runningJob) next[view.runningJob.id] = view.host.name;
-      return next;
-    });
-  }), []);
-
+  const reload = useCallback(() => api.hosts().then(setViews), []);
   useEffect(() => { void reload(); }, [reload]);
+
+  // On first load, resurface running jobs into the dock with their history
+  useEffect(() => {
+    void api.hosts().then(async v => {
+      for (const view of v) {
+        if (view.runningJob) {
+          dispatch({ type: 'job-started', job: view.runningJob });
+          const log = await api.jobLog(view.runningJob.id);
+          dispatch({ type: 'hydrate', jobId: view.runningJob.id, lines: log.split('\n').filter(Boolean) });
+        }
+      }
+    });
+  }, [dispatch]);
 
   useEvents({
     onLog: e => {
-      const host = jobHost[e.jobId];
-      if (host) setLastLine(prev => ({ ...prev, [host]: e.line }));
+      dispatch({ type: 'log', jobId: e.jobId, line: e.line });
+      const tab = dock.tabs.find(t => t.jobId === e.jobId);
+      if (tab) setLastLine(prev => ({ ...prev, [tab.host]: e.line }));
     },
     onState: (job: Job) => {
-      setJobHost(prev => ({ ...prev, [job.id]: job.host }));
+      dispatch({ type: 'state', job });
       void reload();
     },
     onHealth: () => void reload(),
@@ -42,9 +50,8 @@ export default function App() {
     setBusy(true);
     try {
       const res = await api.startJobs(targets, action, source);
-      if (res.refused.length) {
-        alert(res.refused.map(r => `${r.host}: ${r.reason}`).join('\n'));
-      }
+      for (const job of res.started) dispatch({ type: 'job-started', job });
+      if (res.refused.length) alert(res.refused.map(r => `${r.host}: ${r.reason}`).join('\n'));
       await reload();
     } finally { setBusy(false); }
   };
@@ -55,7 +62,7 @@ export default function App() {
   };
 
   return (
-    <main className="mx-auto max-w-7xl p-4 pb-72 space-y-4">
+    <main className="mx-auto max-w-7xl p-4 pb-96 space-y-4">
       <Toolbar
         selectedCount={sel.size}
         eligibleCount={eligible(views, sel).length}
@@ -86,6 +93,16 @@ export default function App() {
           </p>
         )}
       </div>
+      <LogDock
+        dock={dock}
+        sshDestFor={host => views.find(v => v.host.name === host)?.host.sshDest}
+        onSelect={id => dispatch({ type: 'select', jobId: id })}
+        onClose={id => dispatch({ type: 'close', jobId: id })}
+      />
     </main>
   );
+}
+
+function useDock() {
+  return useReducer(dockReducer, emptyDock);
 }
