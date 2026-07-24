@@ -6,6 +6,8 @@ import { dockReducer, emptyDock } from './lib/dock';
 import { HostCard } from './components/HostCard';
 import { Toolbar } from './components/Toolbar';
 import { LogDock } from './components/LogDock';
+import { OnboardDialog } from './components/OnboardDialog';
+import { HistoryDrawer } from './components/HistoryDrawer';
 
 export default function App() {
   const [views, setViews] = useState<HostView[]>([]);
@@ -14,6 +16,8 @@ export default function App() {
   const [busy, setBusy] = useState(false);
   const [lastLine, setLastLine] = useState<Record<string, string>>({});
   const [dock, dispatch] = useDock();
+  const [onboardOpen, setOnboardOpen] = useState(false);
+  const [historyHost, setHistoryHost] = useState<string | null>(null);
 
   const reload = useCallback(() => api.hosts().then(setViews), []);
   useEffect(() => { void reload(); }, [reload]);
@@ -74,7 +78,7 @@ export default function App() {
         onRefresh={() => void refreshHealth()}
         onSelectAll={() => setSel(selectAll(views.map(v => v.host.name)))}
         onClear={() => setSel(clear())}
-        onOnboard={() => { /* dialog added with onboarding UI task */ }}
+        onOnboard={() => setOnboardOpen(true)}
       />
       <div className="grid grid-cols-1 gap-3 md:grid-cols-2 lg:grid-cols-3">
         {views.map(v => (
@@ -83,7 +87,7 @@ export default function App() {
             v={v}
             selected={sel.has(v.host.name)}
             onToggle={() => setSel(s => toggle(s, v.host.name))}
-            onOpenHistory={() => { /* history drawer added later */ }}
+            onOpenHistory={() => setHistoryHost(v.host.name)}
             lastLogLine={lastLine[v.host.name]}
           />
         ))}
@@ -99,6 +103,8 @@ export default function App() {
         onSelect={id => dispatch({ type: 'select', jobId: id })}
         onClose={id => dispatch({ type: 'close', jobId: id })}
       />
+      <OnboardDialog open={onboardOpen} onOpenChange={setOnboardOpen} onDone={() => void reload()} />
+      <HistoryDrawer host={historyHost} onOpenChange={o => { if (!o) setHistoryHost(null); }} />
     </main>
   );
 }
