@@ -1,0 +1,16 @@
+{
+  "compilerOptions": {
+    "module": "esnext",
+    "moduleResolution": "bundler",
+    "target": "es2022",
+    "lib": ["es2022", "dom", "dom.iterable"],
+    "jsx": "react-jsx",
+    "strict": true,
+    "noEmit": true,
+    "skipLibCheck": true,
+    "esModuleInterop": true,
+    "types": ["vite/client"],
+    "paths": { "@/*": ["./src/web/*"] }
+  },
+  "include": ["src/web/**/*", "src/server/types.ts", "src/server/health.ts", "src/server/onboarding.ts"]
+}
