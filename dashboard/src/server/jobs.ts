@@ -66,7 +66,10 @@ export class JobEngine extends EventEmitter {
     await this.t.exec(host.sshDest, `cat > ${d}/job.sh`, { stdin: JOB_SH });
 
     const job = this.store.createJob({ id, host: host.name, action, source, startedAt: Date.now() });
-    const launch = await this.t.exec(host.sshDest, `cd ${d} && nohup bash job.sh > out.log 2>&1 & echo $! > ${d}/pid`);
+    // Brace group is load-bearing: `cd && nohup ... & echo` would background the
+    // whole chain as a subshell whose stdout keeps the ssh channel open until the
+    // script finishes. Only nohup itself may be backgrounded.
+    const launch = await this.t.exec(host.sshDest, `cd ${d} && { nohup bash job.sh < /dev/null > out.log 2>&1 & echo $! > pid; }`);
     if (launch.code !== 0) {
       this.store.updateJob(id, { state: 'failed', exitCode: -1, finishedAt: Date.now() });
       throw new Error(`launch failed: ${launch.stderr}`);
@@ -78,6 +81,69 @@ export class JobEngine extends EventEmitter {
     return running;
   }
 
-  // replaced with full implementation in lifecycle work (Task 6)
-  attach(_job: Job, _sshDest: string): void {}
+  private tails = new Map<string, { kill: () => void }>();
+  private timers = new Map<string, ReturnType<typeof setInterval>>();
+  private lastLineAt = new Map<string, number>();
+
+  attach(job: Job, sshDest: string): void {
+    const d = this.dir(job.id);
+    this.lastLineAt.set(job.id, Date.now());
+    const tail = this.t.stream(sshDest, `tail -n +1 -F ${d}/out.log 2>/dev/null`, line => {
+      this.lastLineAt.set(job.id, Date.now());
+      this.store.appendLog(job.id, line);
+      const cur = this.store.getJob(job.id);
+      if (cur?.state === 'stalled') {
+        this.store.updateJob(job.id, { state: 'running' });
+        this.emit('state', this.store.getJob(job.id));
+      }
+      this.emit('log', { jobId: job.id, line });
+    });
+    this.tails.set(job.id, tail);
+
+    const timer = setInterval(async () => {
+      const r = await this.t.exec(sshDest, `cat ${d}/exit_code 2>/dev/null`);
+      const cur = this.store.getJob(job.id);
+      if (!cur || ['passed', 'failed', 'killed'].includes(cur.state)) { this.detach(job.id); return; }
+      if (r.code === 0 && r.stdout.trim() !== '') {
+        const code = Number(r.stdout.trim());
+        this.store.updateJob(job.id, { state: code === 0 ? 'passed' : 'failed', exitCode: code, finishedAt: Date.now() });
+        this.emit('state', this.store.getJob(job.id));
+        this.detach(job.id);
+        return;
+      }
+      if (cur.state === 'running' && Date.now() - (this.lastLineAt.get(job.id) ?? 0) > this.stallMs) {
+        this.store.updateJob(job.id, { state: 'stalled' });
+        this.emit('state', this.store.getJob(job.id));
+      }
+    }, this.pollMs);
+    this.timers.set(job.id, timer);
+  }
+
+  private detach(id: string): void {
+    this.tails.get(id)?.kill(); this.tails.delete(id);
+    const t = this.timers.get(id); if (t) clearInterval(t); this.timers.delete(id);
+    this.lastLineAt.delete(id);
+  }
+
+  async reattachAll(hosts: Host[]): Promise<void> {
+    const byName = new Map(hosts.map(h => [h.name, h]));
+    for (const job of this.store.runningJobs()) {
+      const host = byName.get(job.host);
+      if (!host) continue;
+      this.attach(job, host.sshDest);
+    }
+  }
+
+  async sendInput(jobId: string, hostDest: string, text: string): Promise<void> {
+    // via stdin so the value never appears in argv or our logs
+    await this.t.exec(hostDest, `cat > ${this.dir(jobId)}/stdin.pipe`, { stdin: text + '\n' });
+  }
+
+  async killJob(jobId: string, hostDest: string): Promise<void> {
+    const d = this.dir(jobId);
+    await this.t.exec(hostDest, `kill $(cat ${d}/pid) 2>/dev/null; pkill -f "jobs/${jobId}/script.sh" 2>/dev/null; true`);
+    this.store.updateJob(jobId, { state: 'killed', finishedAt: Date.now() });
+    this.emit('state', this.store.getJob(jobId));
+    this.detach(jobId);
+  }
 }
