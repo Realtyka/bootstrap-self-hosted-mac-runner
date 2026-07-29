@@ -4,26 +4,35 @@ set -euo pipefail
 # ==================================================
 # REQUIRED VERSIONS (FAIL IF NOT EXACT)
 # ==================================================
-REQUIRED_XCODE_VERSION="16.4"
+REQUIRED_XCODE_VERSION="26.6"
 REQUIRED_NODE_VERSION="24.16.0"
 REQUIRED_RUBY_VERSION="3.1.2"
 REQUIRED_COCOAPODS_VERSION="1.16.2"
 NVM_VERSION="v0.40.4"
 
-# Simulator pinning
-REQUIRED_IOS_SIM_RUNTIME_NAME="iOS 18.6"
-REQUIRED_SIM_DEVICE_TYPE="iPhone 16 Pro"
-CI_SIM_NAME="CI iPhone 16 Pro (18.6)"
+# Xcode 26.4 raised the floor from macOS 15.6 to macOS 26.2. An older runner can
+# install Xcode 26.6 but the app will refuse to launch, so fail before the
+# multi-gigabyte download rather than halfway through provisioning.
+REQUIRED_MACOS_VERSION="26.2"
+
+# Simulator pinning.
+#
+# The runtime is pinned by MAJOR version only, and the newest installed iOS 26.x
+# is resolved at run time. Apple does not keep simulator runtime versions in step
+# with Xcode minor versions — Xcode 26.6 ships the iOS 26.5 SDK and no "iOS 26.6"
+# runtime exists — so an exact runtime pin would need re-editing on every Xcode
+# bump and would hard-fail whenever the two drift.
+REQUIRED_IOS_SIM_RUNTIME_MAJOR="26"
+REQUIRED_SIM_DEVICE_TYPE="iPhone 17 Pro"
 # Optional escape hatch if runtime install isn't supported automatically:
 # Provide a local path to a downloaded runtime DMG
-# Example: export IOS_RUNTIME_DMG_PATH="/path/to/iOS_18.6_Simulator_Runtime.dmg"
+# Example: export IOS_RUNTIME_DMG_PATH="/path/to/iOS_26.5_Simulator_Runtime.dmg"
 IOS_RUNTIME_DMG_PATH="${IOS_RUNTIME_DMG_PATH:-}"
 
-# Additional Xcode (installed alongside the default, NOT selected as default)
-ADDITIONAL_XCODE_VERSION="26.0"
-ADDITIONAL_IOS_SIM_RUNTIME_NAME="iOS 26.0"
-ADDITIONAL_SIM_DEVICE_TYPE="iPhone 17 Pro"
-CI_ADDITIONAL_SIM_NAME="CI iPhone 17 Pro (26.0)"
+# Superseded toolchains removed by this script. Exact versions only, so anything
+# installed on a runner outside this script is left alone.
+LEGACY_XCODE_VERSIONS=("16.4" "26.0")
+LEGACY_NODE_VERSIONS=("22.12.0")
 
 # ==================================================
 # Helpers
@@ -31,6 +40,110 @@ CI_ADDITIONAL_SIM_NAME="CI iPhone 17 Pro (26.0)"
 log() { echo -e "\n\033[1;34m==>\033[0m $*"; }
 die() { echo -e "\n\033[1;31mERROR:\033[0m $*" >&2; exit 1; }
 command_exists() { command -v "$1" >/dev/null 2>&1; }
+
+# True when $1 >= $2, comparing dotted version strings.
+version_gte() {
+  [[ "$(printf '%s\n%s\n' "$2" "$1" | sort -V | head -n1)" == "$2" ]]
+}
+
+# ==================================================
+# Xcode uninstall helpers
+# ==================================================
+# `xcodes installed <version>` is the only non-interactive presence probe: it
+# prints the app bundle path and exits 0, or exits 1 when the version is absent.
+#
+# Deliberately NOT used here:
+#   * `xcodes installed | grep "^<ver>\b"` — the `.` is a regex wildcard and the
+#     `\b` sits on the 0/. boundary, so `^26.0\b` also matches a `26.0.1` row.
+#   * a constructed path — xcodes always writes three version components, so
+#     `xcodes install 26.6` yields /Applications/Xcode-26.6.0.app and a
+#     hand-rolled `Xcode-26.6.app` guess would never match.
+#
+# xcodes logs everything through print() — including errors — to stdout, and an
+# unparseable version makes `installed` dump the entire table and still exit 0.
+# So require a zero exit AND a single-line path to an existing bundle.
+xcode_path_for_version() {
+  local version="$1" out
+  command_exists xcodes || return 1
+  out="$(xcodes installed "${version}" --no-color 2>/dev/null)" || return 1
+  [[ "${out}" == *$'\n'* ]] && return 1          # multi-line => the whole table
+  [[ "${out}" == /*.app && -d "${out}" ]] || return 1
+  printf '%s\n' "${out}"
+}
+
+# True when the given app bundle is what xcode-select currently points at.
+xcode_is_selected() {
+  local selected
+  selected="$(xcode-select -p 2>/dev/null || true)"
+  [[ -n "${selected}" && "${selected}" == "${1}/"* ]]
+}
+
+_uninstall_xcode_bundle() {
+  local version="$1" app="$2"
+  # A running Xcode or Simulator from this bundle blocks the delete. Anchored to
+  # the bundle path so the pattern cannot match this script itself.
+  pkill -f "^${app}/Contents/MacOS/" 2>/dev/null || true
+
+  log "Uninstalling Xcode ${version} (${app})..."
+  # --empty-trash : without it the ~30 GB bundle only moves to ~/.Trash and the
+  #                 runner's disk is never actually reclaimed. Nothing empties
+  #                 the Trash on a headless auto-login box.
+  # </dev/null    : if the version disappears between the probe and this call,
+  #                 xcodes falls back to an INTERACTIVE picker (it calls
+  #                 readLine on stdin). On a TTY that hangs provisioning
+  #                 forever; at EOF it exits non-zero instead.
+  # no sudo       : xcodes deletes as the invoking user (/Applications is
+  #                 drwxrwxr-x root:admin); sudo would relocate its config,
+  #                 keychain and Trash to /var/root.
+  if ! xcodes uninstall "${version}" --empty-trash --no-color </dev/null; then
+    die "xcodes uninstall ${version} failed (bundle still at ${app})"
+  fi
+  if [[ -d "${app}" ]]; then
+    die "Xcode ${version} still present at ${app} after uninstall"
+  fi
+  log "Xcode ${version} removed"
+}
+
+# Strict: idempotent no-op when absent, hard failure when the target is the
+# currently selected Xcode. Use only AFTER the replacement has been selected.
+uninstall_xcode_if_present() {
+  local version="$1" app
+  if ! app="$(xcode_path_for_version "${version}")"; then
+    log "Xcode ${version} is not installed — nothing to uninstall"
+    return 0
+  fi
+  if xcode_is_selected "${app}"; then
+    die "Refusing to uninstall Xcode ${version}: it is the currently selected Xcode.
+     Select Xcode ${REQUIRED_XCODE_VERSION} first (sudo xcode-select -s <app>/Contents/Developer)."
+  fi
+  _uninstall_xcode_bundle "${version}" "${app}"
+}
+
+# Opportunistic: used BEFORE the replacement is selected, to cap peak disk use.
+# Skips (never aborts) when the target is the selected Xcode — removing it there
+# would leave /var/db/xcode_select_link dangling, and xcode-select does not fall
+# back, so every later xcodebuild/xcrun call would fail. The strict pass removes
+# it once Xcode ${REQUIRED_XCODE_VERSION} is active.
+try_uninstall_xcode() {
+  local version="$1" app
+  app="$(xcode_path_for_version "${version}")" || return 0
+  if xcode_is_selected "${app}"; then
+    log "Xcode ${version} is currently selected — deferring removal until ${REQUIRED_XCODE_VERSION} is active"
+    return 0
+  fi
+  _uninstall_xcode_bundle "${version}" "${app}"
+}
+
+# ==================================================
+# macOS version floor (FAIL FAST)
+# ==================================================
+# First real statement in the script on purpose: sw_vers and sort -V are both in
+# the base system, so this can run before Homebrew, before any download, and
+# before anything is removed.
+MACOS_VERSION="$(sw_vers -productVersion)"
+version_gte "${MACOS_VERSION}" "${REQUIRED_MACOS_VERSION}" \
+  || die "Xcode ${REQUIRED_XCODE_VERSION} requires macOS ${REQUIRED_MACOS_VERSION} or later; this host runs ${MACOS_VERSION}. Upgrade macOS before provisioning this runner."
+log "macOS OK: ${MACOS_VERSION}"
 
 # ==================================================
 # 1) Homebrew (official installer)
@@ -67,34 +180,54 @@ XCODE_ALREADY_INSTALLED=false
 if command_exists xcodebuild; then
   CURRENT_XCODE_VERSION="$(xcodebuild -version 2>/dev/null | head -n1 | awk '{print $2}' || true)"
   if [[ "${CURRENT_XCODE_VERSION}" == "${REQUIRED_XCODE_VERSION}" ]]; then
-    log "Xcode ${REQUIRED_XCODE_VERSION} is already installed — skipping xcodes"
+    log "Xcode ${REQUIRED_XCODE_VERSION} is already installed and selected — skipping install"
     XCODE_ALREADY_INSTALLED=true
   fi
 fi
 
-if [[ "${XCODE_ALREADY_INSTALLED}" == false ]]; then
-  # xcodes README: you can provide Apple ID creds via XCODES_USERNAME / XCODES_PASSWORD
+# Ensure the xcodes binary. Hoisted out of the install branch on purpose: even on
+# a re-run where 26.6 is already selected we still need xcodes for the legacy
+# cleanup below, and uninstalling requires no Apple ID.
+# (Use the pre-built binary — the brew formula requires Xcode to compile from
+# source, which defeats the purpose.)
+if ! command_exists xcodes; then
+  log "Installing xcodes (pre-built binary)..."
+  curl -sL "https://github.com/XcodesOrg/xcodes/releases/latest/download/xcodes.zip" -o /tmp/xcodes.zip
+  unzip -o /tmp/xcodes.zip -d /tmp
+  install -m 755 /tmp/xcodes "$(brew --prefix)/bin/xcodes"
+  rm -f /tmp/xcodes.zip /tmp/xcodes
+fi
+
+# Validate the download precondition BEFORE anything destructive runs. The
+# pre-pass below permanently deletes Xcode bundles (xcodes --empty-trash calls
+# removeItem, so there is no Trash copy to restore), and a missing Apple ID would
+# otherwise abort the run *after* the old toolchain is gone but before the new one
+# is installed — leaving the runner unable to build anything.
+# xcodes README: you can provide Apple ID creds via XCODES_USERNAME / XCODES_PASSWORD
+XCODE_NEEDS_DOWNLOAD=false
+if [[ "${XCODE_ALREADY_INSTALLED}" == false ]] \
+   && ! xcode_path_for_version "${REQUIRED_XCODE_VERSION}" >/dev/null; then
   if [[ -z "${XCODE_APPLE_ID:-}" || -z "${XCODE_APPLE_ID_PASSWORD:-}" ]]; then
-    die "Xcode install requires XCODE_APPLE_ID and XCODE_APPLE_ID_PASSWORD env vars"
+    die "Xcode ${REQUIRED_XCODE_VERSION} is not installed and must be downloaded, which requires the XCODE_APPLE_ID and XCODE_APPLE_ID_PASSWORD env vars. Nothing has been removed — export them and re-run."
   fi
   export XCODES_USERNAME="${XCODE_APPLE_ID}"
   export XCODES_PASSWORD="${XCODE_APPLE_ID_PASSWORD}"
+  XCODE_NEEDS_DOWNLOAD=true
+fi
 
-  # Install xcodes if missing (use pre-built binary — brew formula requires
-  # Xcode to compile from source, which defeats the purpose)
-  if ! command_exists xcodes; then
-    log "Installing xcodes (pre-built binary)..."
-    curl -sL "https://github.com/XcodesOrg/xcodes/releases/latest/download/xcodes.zip" -o /tmp/xcodes.zip
-    unzip -o /tmp/xcodes.zip -d /tmp
-    install -m 755 /tmp/xcodes "$(brew --prefix)/bin/xcodes"
-    rm -f /tmp/xcodes.zip /tmp/xcodes
-  fi
+# Opportunistic legacy cleanup BEFORE the download, so a migrating runner never
+# needs disk for three Xcodes plus a ~12 GB .xip at once.
+log "Removing superseded Xcode versions (pre-pass)..."
+for _legacy_xcode in "${LEGACY_XCODE_VERSIONS[@]}"; do
+  try_uninstall_xcode "${_legacy_xcode}"
+done
 
-  if ! xcodes installed | grep -q "^${REQUIRED_XCODE_VERSION}\b"; then
-    log "Downloading and installing Xcode ${REQUIRED_XCODE_VERSION}..."
+if [[ "${XCODE_ALREADY_INSTALLED}" == false ]]; then
+  if [[ "${XCODE_NEEDS_DOWNLOAD}" == true ]]; then
+    log "Downloading and installing Xcode ${REQUIRED_XCODE_VERSION} (this will take a while)..."
     xcodes install "${REQUIRED_XCODE_VERSION}" --select
   else
-    log "Xcode ${REQUIRED_XCODE_VERSION} already installed"
+    log "Xcode ${REQUIRED_XCODE_VERSION} already installed — selecting it"
     xcodes select "${REQUIRED_XCODE_VERSION}"
   fi
 fi
@@ -108,6 +241,14 @@ sudo xcodebuild -license accept
 log "Installing Xcode first-launch system packages..."
 sudo xcodebuild -runFirstLaunch
 
+# Kill stale CoreSimulatorService — changing the active Xcode version causes a
+# framework version mismatch (e.g. 1048 vs 1010.15) that makes simctl and runtime
+# downloads fail. A migrating runner switches 16.4 -> 26.6 above, so this must
+# run before the simctl functional check below.
+log "Resetting CoreSimulatorService after Xcode version change..."
+sudo killall -9 com.apple.CoreSimulator.CoreSimulatorService 2>/dev/null || true
+sleep 2
+
 # ==================================================
 # Validate Xcode version (FAIL FAST)
 # ==================================================
@@ -118,215 +259,131 @@ log "Xcode OK: ${ACTUAL_XCODE_VERSION}"
 
 # Validate Xcode components are functional (catches partial installs)
 if ! xcrun simctl list devicetypes >/dev/null 2>&1; then
-  die "Xcode ${REQUIRED_XCODE_VERSION} appears broken (simctl not functional). Remove it and re-run this script:\n  sudo rm -rf /Applications/Xcode-${REQUIRED_XCODE_VERSION}*.app && xcodes install ${REQUIRED_XCODE_VERSION} --select"
+  die "Xcode ${REQUIRED_XCODE_VERSION} appears broken (simctl not functional). Remove it and re-run this script:\n  xcodes uninstall ${REQUIRED_XCODE_VERSION} --empty-trash && xcodes install ${REQUIRED_XCODE_VERSION} --select"
 fi
 
 # ==================================================
-# Simulator runtime + device (iPhone 16 Pro / iOS 18.6)
+# Remove superseded Xcode versions (strict pass)
 # ==================================================
-log "Ensuring simulator runtime '${REQUIRED_IOS_SIM_RUNTIME_NAME}' and device '${CI_SIM_NAME}' exist..."
+# Safe only here: Xcode ${REQUIRED_XCODE_VERSION} is installed, selected and
+# validated, so neither legacy version can still be the xcode-select target.
+log "Removing superseded Xcode versions..."
+for _legacy_xcode in "${LEGACY_XCODE_VERSIONS[@]}"; do
+  uninstall_xcode_if_present "${_legacy_xcode}"
+done
 
-# Ensure the device type exists in this Xcode
-if ! xcrun simctl list devicetypes | grep -Fq "${REQUIRED_SIM_DEVICE_TYPE}"; then
+# Both passes gate on `xcodes installed`, which resolves a bundle by reading its
+# Info.plist. A bundle left half-deleted by an interrupted run has no readable
+# version, so it reports as "not installed" forever and its disk is never
+# reclaimed. Check the canonical path xcodes would have used and say so out loud.
+# Warn rather than die: a leftover directory wastes disk but does not make the
+# provisioned toolchain wrong, and failing here would block the runner for it.
+for _legacy_xcode in "${LEGACY_XCODE_VERSIONS[@]}"; do
+  _legacy_app="/Applications/Xcode-${_legacy_xcode}.0.app"
+  if [[ -d "${_legacy_app}" ]]; then
+    log "Warning: ${_legacy_app} still exists but xcodes cannot resolve its version (likely a partially deleted bundle from an interrupted run). Remove it manually to reclaim the disk:\n  rm -rf '${_legacy_app}'"
+  fi
+done
+unset _legacy_xcode _legacy_app
+
+# Simulator runtimes are CoreSimulator disk images under
+# /Library/Developer/CoreSimulator, and CoreSimulator.framework lives in
+# /Library/Developer/PrivateFrameworks — none of it sits inside an Xcode bundle,
+# so the uninstalls cannot have removed a runtime. Prove it rather than assume.
+xcrun simctl list runtimes >/dev/null \
+  || die "simctl is broken after removing the superseded Xcode versions"
+
+# ==================================================
+# Simulator runtime + device (iPhone 17 Pro / newest iOS 26.x)
+# ==================================================
+log "Ensuring an iOS ${REQUIRED_IOS_SIM_RUNTIME_MAJOR}.x simulator runtime and a '${REQUIRED_SIM_DEVICE_TYPE}' device exist..."
+
+# Ensure the device type exists in this Xcode. Matched against the start of the
+# trailing identifier so "iPhone 17 Pro" cannot be satisfied by a
+# "iPhone 17 Pro Max" row.
+if ! xcrun simctl list devicetypes | grep -Fq "${REQUIRED_SIM_DEVICE_TYPE} (com.apple."; then
   die "Simulator device type '${REQUIRED_SIM_DEVICE_TYPE}' not found in this Xcode. Check Xcode version/components."
 fi
 
-get_runtime_id() {
-  xcrun simctl list runtimes \
-    | grep -F "${REQUIRED_IOS_SIM_RUNTIME_NAME}" \
-    | grep -oE 'com\.apple\.CoreSimulator\.SimRuntime\.[A-Za-z0-9.\-]+' \
-    | head -n1 || true
+# Resolve the newest installed iOS <major>.x runtime.
+# Prints "<version> <identifier>", or nothing when none is installed.
+get_runtime_entry() {
+  xcrun simctl list runtimes 2>/dev/null \
+    | grep -E "^iOS ${REQUIRED_IOS_SIM_RUNTIME_MAJOR}\.[0-9]" \
+    | grep -v -i 'unavailable' \
+    | sed -E 's/^iOS ([0-9.]+) .* - (com\.apple\.CoreSimulator\.SimRuntime\.[A-Za-z0-9.-]+).*$/\1 \2/' \
+    | sort -V \
+    | tail -n1 || true
 }
 
-runtime_identifier="$(get_runtime_id)"
+runtime_entry="$(get_runtime_entry)"
 
-if [[ -z "${runtime_identifier}" ]]; then
-  log "Runtime '${REQUIRED_IOS_SIM_RUNTIME_NAME}' not installed yet."
+if [[ -z "${runtime_entry}" ]]; then
+  log "No iOS ${REQUIRED_IOS_SIM_RUNTIME_MAJOR}.x runtime installed yet."
 
-  # First try: xcodes runtimes install (only if xcodes is available)
-  if command_exists xcodes; then
-    log "Attempting to install runtime via xcodes..."
-    set +e
-    xcodes runtimes install "${REQUIRED_IOS_SIM_RUNTIME_NAME}"
-    rc=$?
-    set -e
+  # Primary: xcodebuild -downloadPlatform (Apple's native approach, Xcode 15+).
+  # Fetches the latest iOS platform for the selected Xcode.
+  log "Downloading iOS platform via xcodebuild..."
+  set +e
+  xcodebuild -downloadPlatform iOS
+  set -e
+  runtime_entry="$(get_runtime_entry)"
 
-    runtime_identifier="$(get_runtime_id)"
-  fi
-
-  if [[ -z "${runtime_identifier}" ]]; then
-    if [[ -n "${IOS_RUNTIME_DMG_PATH}" ]]; then
-      log "Trying simctl runtime add from DMG: ${IOS_RUNTIME_DMG_PATH}"
-      [[ -f "${IOS_RUNTIME_DMG_PATH}" ]] || die "IOS_RUNTIME_DMG_PATH does not exist: ${IOS_RUNTIME_DMG_PATH}"
-      xcrun simctl runtime add "${IOS_RUNTIME_DMG_PATH}"
-
-      runtime_identifier="$(get_runtime_id)"
+  # Fallback: xcodes runtimes install. It needs an explicit runtime name, so ask
+  # xcodes for the newest iOS <major>.x it offers.
+  if [[ -z "${runtime_entry}" ]] && command_exists xcodes; then
+    log "xcodebuild did not yield an iOS ${REQUIRED_IOS_SIM_RUNTIME_MAJOR}.x runtime — falling back to xcodes..."
+    runtime_candidate="$(xcodes runtimes 2>/dev/null \
+      | grep -oE "^iOS ${REQUIRED_IOS_SIM_RUNTIME_MAJOR}\.[0-9.]+" \
+      | sort -V \
+      | tail -n1 || true)"
+    if [[ -n "${runtime_candidate}" ]]; then
+      set +e
+      xcodes runtimes install "${runtime_candidate}"
+      set -e
+      runtime_entry="$(get_runtime_entry)"
+    else
+      log "xcodes offered no iOS ${REQUIRED_IOS_SIM_RUNTIME_MAJOR}.x runtime"
     fi
   fi
 
-  [[ -n "${runtime_identifier}" ]] || die "Unable to install/find runtime '${REQUIRED_IOS_SIM_RUNTIME_NAME}'. Install it in Xcode > Settings > Platforms, or provide IOS_RUNTIME_DMG_PATH to a runtime DMG."
+  # Last resort: local DMG
+  if [[ -z "${runtime_entry}" && -n "${IOS_RUNTIME_DMG_PATH}" ]]; then
+    log "Trying simctl runtime add from DMG: ${IOS_RUNTIME_DMG_PATH}"
+    [[ -f "${IOS_RUNTIME_DMG_PATH}" ]] || die "IOS_RUNTIME_DMG_PATH does not exist: ${IOS_RUNTIME_DMG_PATH}"
+    xcrun simctl runtime add "${IOS_RUNTIME_DMG_PATH}"
+    runtime_entry="$(get_runtime_entry)"
+  fi
+
+  [[ -n "${runtime_entry}" ]] \
+    || die "Unable to install/find an iOS ${REQUIRED_IOS_SIM_RUNTIME_MAJOR}.x runtime.\nInstalled runtimes:\n$(xcrun simctl list runtimes 2>/dev/null || true)\nInstall one via Xcode > Settings > Platforms, or provide IOS_RUNTIME_DMG_PATH to a runtime DMG."
 fi
 
-log "Runtime OK: ${runtime_identifier}"
+RUNTIME_VERSION="${runtime_entry%% *}"
+runtime_identifier="${runtime_entry##* }"
+log "Runtime OK: iOS ${RUNTIME_VERSION} (${runtime_identifier})"
 
-# Boot the default simulator once to warm it up
-set +eo pipefail
-default_udid="$(xcrun simctl list devices \
-  | grep "${REQUIRED_SIM_DEVICE_TYPE}" \
+# Boot the default simulator once to warm it up. Scoped to the resolved runtime's
+# section of `simctl list devices`, and anchored on "<device type> (" so the
+# lookup cannot drift onto a "... Pro Max" device.
+default_udid="$(xcrun simctl list devices 2>/dev/null \
+  | awk -v want="-- iOS ${RUNTIME_VERSION} --" '
+      /^-- / { in_section = ($0 == want); next }
+      in_section { print }
+    ' \
+  | grep -E "^[[:space:]]*${REQUIRED_SIM_DEVICE_TYPE} \(" \
   | grep -oE '[0-9A-Fa-f]{8}-([0-9A-Fa-f]{4}-){3}[0-9A-Fa-f]{12}' \
-  | head -n1)"
-set -eo pipefail
+  | head -n1 || true)"
 
 if [[ -n "${default_udid}" ]]; then
-  log "Warming up default simulator: ${REQUIRED_SIM_DEVICE_TYPE} (${default_udid})..."
+  log "Warming up simulator: ${REQUIRED_SIM_DEVICE_TYPE} (${default_udid})..."
   xcrun simctl boot "${default_udid}" || true
   xcrun simctl bootstatus "${default_udid}" -b
   xcrun simctl shutdown "${default_udid}" || true
   log "Simulator ready: ${default_udid}"
 else
-  log "Warning: No ${REQUIRED_SIM_DEVICE_TYPE} simulator found for ${REQUIRED_IOS_SIM_RUNTIME_NAME}"
+  log "Warning: No ${REQUIRED_SIM_DEVICE_TYPE} simulator found for iOS ${RUNTIME_VERSION}"
 fi
-
-# ==================================================
-# Additional Xcode (installed alongside, NOT the default)
-# ==================================================
-log "Ensuring additional Xcode ${ADDITIONAL_XCODE_VERSION} is installed..."
-
-ADDITIONAL_XCODE_INSTALLED=false
-if command_exists xcodes && xcodes installed 2>/dev/null | grep -q "^${ADDITIONAL_XCODE_VERSION}\b"; then
-  ADDITIONAL_XCODE_INSTALLED=true
-  log "Xcode ${ADDITIONAL_XCODE_VERSION} is already installed — skipping"
-fi
-
-if [[ "${ADDITIONAL_XCODE_INSTALLED}" == false ]]; then
-  # Ensure xcodes is available
-  if ! command_exists xcodes; then
-    log "Installing xcodes (pre-built binary)..."
-    curl -sL "https://github.com/XcodesOrg/xcodes/releases/latest/download/xcodes.zip" -o /tmp/xcodes.zip
-    unzip -o /tmp/xcodes.zip -d /tmp
-    install -m 755 /tmp/xcodes "$(brew --prefix)/bin/xcodes"
-    rm -f /tmp/xcodes.zip /tmp/xcodes
-  fi
-
-  # Ensure credentials are available
-  if [[ -z "${XCODES_USERNAME:-}" ]]; then
-    if [[ -z "${XCODE_APPLE_ID:-}" || -z "${XCODE_APPLE_ID_PASSWORD:-}" ]]; then
-      die "Xcode ${ADDITIONAL_XCODE_VERSION} install requires XCODE_APPLE_ID and XCODE_APPLE_ID_PASSWORD env vars"
-    fi
-    export XCODES_USERNAME="${XCODE_APPLE_ID}"
-    export XCODES_PASSWORD="${XCODE_APPLE_ID_PASSWORD}"
-  fi
-
-  log "Downloading and installing Xcode ${ADDITIONAL_XCODE_VERSION} (this will take a while)..."
-  xcodes install "${ADDITIONAL_XCODE_VERSION}"
-fi
-
-# Locate the Xcode app bundle for the additional version
-ADDITIONAL_XCODE_APP=""
-for app in /Applications/Xcode*"${ADDITIONAL_XCODE_VERSION}"*.app; do
-  if [[ -d "$app" ]]; then
-    ADDITIONAL_XCODE_APP="$app"
-    break
-  fi
-done
-[[ -n "${ADDITIONAL_XCODE_APP}" ]] \
-  || die "Cannot find Xcode ${ADDITIONAL_XCODE_VERSION} app bundle in /Applications"
-
-log "Found Xcode ${ADDITIONAL_XCODE_VERSION} at ${ADDITIONAL_XCODE_APP}"
-
-# Save current xcode-select path so we can restore the default afterwards
-DEFAULT_XCODE_PATH="$(xcode-select -p)"
-
-# Temporarily switch to Xcode 26 for license, first-launch, and simulator setup
-log "Temporarily selecting Xcode ${ADDITIONAL_XCODE_VERSION} for setup..."
-sudo xcode-select -s "${ADDITIONAL_XCODE_APP}/Contents/Developer"
-
-sudo xcodebuild -license accept
-
-log "Installing Xcode ${ADDITIONAL_XCODE_VERSION} first-launch system packages..."
-sudo xcodebuild -runFirstLaunch
-
-# Kill stale CoreSimulatorService — switching Xcode versions causes a framework
-# version mismatch (e.g. 1048 vs 1010.15) that makes simctl/runtime downloads fail.
-log "Resetting CoreSimulatorService after Xcode version switch..."
-sudo killall -9 com.apple.CoreSimulator.CoreSimulatorService 2>/dev/null || true
-sleep 2
-
-# --- Simulator runtime + device for additional Xcode ---
-log "Ensuring simulator runtime '${ADDITIONAL_IOS_SIM_RUNTIME_NAME}' and device '${CI_ADDITIONAL_SIM_NAME}' exist..."
-
-# Ensure the device type exists in this Xcode
-if ! xcrun simctl list devicetypes | grep -Fq "${ADDITIONAL_SIM_DEVICE_TYPE}"; then
-  die "Simulator device type '${ADDITIONAL_SIM_DEVICE_TYPE}' not found in Xcode ${ADDITIONAL_XCODE_VERSION}. Check Xcode version/components."
-fi
-
-get_additional_runtime_id() {
-  xcrun simctl list runtimes \
-    | grep -F "${ADDITIONAL_IOS_SIM_RUNTIME_NAME}" \
-    | grep -oE 'com\.apple\.CoreSimulator\.SimRuntime\.[A-Za-z0-9.\-]+' \
-    | head -n1 || true
-}
-
-additional_runtime_id="$(get_additional_runtime_id)"
-
-if [[ -z "${additional_runtime_id}" ]]; then
-  # Primary method: xcodebuild -downloadPlatform (Apple's native approach, Xcode 15+)
-  log "Runtime '${ADDITIONAL_IOS_SIM_RUNTIME_NAME}' not found — downloading via xcodebuild..."
-  set +e
-  xcodebuild -downloadPlatform iOS
-  set -e
-  additional_runtime_id="$(get_additional_runtime_id)"
-
-  # Fallback: xcodes runtimes install
-  if [[ -z "${additional_runtime_id}" ]] && command_exists xcodes; then
-    log "xcodebuild download did not work — falling back to xcodes..."
-    set +e
-    xcodes runtimes install "${ADDITIONAL_IOS_SIM_RUNTIME_NAME}"
-    set -e
-    additional_runtime_id="$(get_additional_runtime_id)"
-  fi
-
-  # Last resort: local DMG
-  if [[ -z "${additional_runtime_id}" && -n "${IOS_RUNTIME_DMG_PATH}" ]]; then
-    log "Trying simctl runtime add from DMG: ${IOS_RUNTIME_DMG_PATH}"
-    [[ -f "${IOS_RUNTIME_DMG_PATH}" ]] || die "IOS_RUNTIME_DMG_PATH does not exist: ${IOS_RUNTIME_DMG_PATH}"
-    xcrun simctl runtime add "${IOS_RUNTIME_DMG_PATH}"
-    additional_runtime_id="$(get_additional_runtime_id)"
-  fi
-fi
-
-if [[ -n "${additional_runtime_id}" ]]; then
-  log "Additional runtime OK: ${additional_runtime_id}"
-
-  # Warm up a simulator for the additional Xcode
-  set +eo pipefail
-  additional_udid="$(xcrun simctl list devices \
-    | grep "${ADDITIONAL_SIM_DEVICE_TYPE}" \
-    | grep -oE '[0-9A-Fa-f]{8}-([0-9A-Fa-f]{4}-){3}[0-9A-Fa-f]{12}' \
-    | head -n1)"
-  set -eo pipefail
-
-  if [[ -n "${additional_udid}" ]]; then
-    log "Warming up Xcode ${ADDITIONAL_XCODE_VERSION} simulator: ${ADDITIONAL_SIM_DEVICE_TYPE} (${additional_udid})..."
-    xcrun simctl boot "${additional_udid}" || true
-    xcrun simctl bootstatus "${additional_udid}" -b
-    xcrun simctl shutdown "${additional_udid}" || true
-    log "Additional simulator ready: ${additional_udid}"
-  else
-    log "Warning: No ${ADDITIONAL_SIM_DEVICE_TYPE} simulator found for ${ADDITIONAL_IOS_SIM_RUNTIME_NAME}"
-  fi
-else
-  log "Warning: Runtime '${ADDITIONAL_IOS_SIM_RUNTIME_NAME}' could not be installed. Install it manually via Xcode > Settings > Platforms."
-fi
-
-# Restore default Xcode
-log "Restoring default Xcode (${REQUIRED_XCODE_VERSION})..."
-sudo xcode-select -s "${DEFAULT_XCODE_PATH}"
-
-RESTORED_XCODE_VERSION="$(xcodebuild -version | head -n1 | awk '{print $2}')"
-[[ "${RESTORED_XCODE_VERSION}" == "${REQUIRED_XCODE_VERSION}" ]] \
-  || die "Failed to restore default Xcode: expected ${REQUIRED_XCODE_VERSION}, got ${RESTORED_XCODE_VERSION}"
-log "Active Xcode restored: ${RESTORED_XCODE_VERSION}"
 
 # ==================================================
 # 2) NVM + Node.js (official installer)
@@ -356,6 +413,76 @@ else
     || die "Node version mismatch: expected ${REQUIRED_NODE_VERSION}, got ${ACTUAL_NODE_VERSION}"
 fi
 log "Node OK: ${ACTUAL_NODE_VERSION}"
+
+# ==================================================
+# 2b) Remove superseded Node versions
+# ==================================================
+# Placement matters: `source nvm.sh` above takes no arguments, so nvm auto-uses
+# whatever the `default` alias points at. On an un-migrated runner that is the
+# legacy version, and `nvm uninstall` on the *active* version returns 1 — which
+# would kill the script under `set -e`. Running after the pin block guarantees
+# ${REQUIRED_NODE_VERSION} is active first.
+nvm_uninstall_if_present() {
+  local version="$1"
+  local version_dir="${NVM_DIR}/versions/node/v${version}"
+
+  # Exact-path probe — byte-for-byte what nvm_is_version_installed does.
+  # `nvm ls` / `nvm version` are NOT safe here: a partial pattern resolves onto a
+  # DIFFERENT installed version and still returns 0 (e.g. `22.12` -> v22.12.1),
+  # so a shortened version string could uninstall the wrong Node.
+  if [[ ! -x "${version_dir}/bin/node" ]]; then
+    log "Node ${version} not installed — nothing to remove"
+    return 0
+  fi
+
+  # Guarantee the target is not the active version, and leave the pin active for
+  # the Corepack step below.
+  nvm use "${REQUIRED_NODE_VERSION}" >/dev/null || true
+
+  # `if` consumes the exit status: nvm returns 1 for an active version and for
+  # bad permissions on the install dir — neither should fail provisioning.
+  if nvm uninstall "${version}"; then
+    log "Removed Node ${version}"
+    REMOVED_NODE_VERSIONS+=("${version}")
+  else
+    log "Warning: could not remove Node ${version} — continuing"
+  fi
+
+  # nvm only prunes a `.cache/bin/<slug>/files` directory, which this layout does
+  # not have, so the downloaded tarball would otherwise be stranded.
+  rm -rf "${NVM_DIR}/.cache/bin/node-v${version}-"* 2>/dev/null || true
+}
+
+REMOVED_NODE_VERSIONS=()
+for _legacy_node in "${LEGACY_NODE_VERSIONS[@]}"; do
+  nvm_uninstall_if_present "${_legacy_node}"
+done
+unset _legacy_node
+
+# The runner service reads its PATH from actions-runner/.path, which pins an
+# absolute nvm node bin dir. If that file still points at a version just removed,
+# the service's PATH is now broken — setup-runner-launchagent.sh rewrites it from
+# the nvm default alias, so tell the operator to re-run it.
+if (( ${#REMOVED_NODE_VERSIONS[@]} > 0 )); then
+  RUNNER_PATH_FILE="${RUNNER_DIR:-$HOME/actions-runner}/.path"
+  for _removed_node in "${REMOVED_NODE_VERSIONS[@]}"; do
+    if [[ -f "${RUNNER_PATH_FILE}" ]] && grep -Fq "versions/node/v${_removed_node}/" "${RUNNER_PATH_FILE}"; then
+      log "Warning: ${RUNNER_PATH_FILE} still references the removed Node v${_removed_node}.\n  The runner service PATH is now stale — re-run setup-runner-launchagent.sh to rewrite it."
+    fi
+  done
+  unset _removed_node
+fi
+
+# Re-assert the default alias. nvm's own alias cleanup on uninstall is a no-op
+# (its glob is double-quoted, so the loop never runs), which leaves `default`
+# pointing at the version just deleted. setup-runner-launchagent.sh resolves that
+# alias and hard-fails if it dangles.
+if [[ -x "${NVM_DIR}/versions/node/v${REQUIRED_NODE_VERSION}/bin/node" ]]; then
+  nvm alias default "${REQUIRED_NODE_VERSION}" >/dev/null
+  log "nvm default alias -> v${REQUIRED_NODE_VERSION}"
+else
+  log "Warning: Node v${REQUIRED_NODE_VERSION} is not managed by nvm — leaving default alias untouched"
+fi
 
 # ==================================================
 # Corepack (yarn shim)
@@ -470,16 +597,17 @@ log "Bootstrap complete ✅"
 cat <<EOF
 
 Locked versions:
-- Xcode (default) : ${ACTUAL_XCODE_VERSION}
-- Xcode (extra)   : ${ADDITIONAL_XCODE_VERSION} (${ADDITIONAL_XCODE_APP})
+- macOS           : ${MACOS_VERSION}
+- Xcode           : ${ACTUAL_XCODE_VERSION}
 - Node            : ${ACTUAL_NODE_VERSION}
 - Yarn (corepack) : ${YARN_SHIM}
 - Ruby            : ${ACTUAL_RUBY_VERSION}
 - CocoaPods       : ${ACTUAL_COCOAPODS_VERSION}
 - applesimutils   : $(applesimutils --version 2>/dev/null || echo "installed")
 - Simulator       : ${REQUIRED_SIM_DEVICE_TYPE} (${default_udid:-none})
-- Runtime         : ${REQUIRED_IOS_SIM_RUNTIME_NAME} (${runtime_identifier})
-- Extra Runtime   : ${ADDITIONAL_IOS_SIM_RUNTIME_NAME} (${additional_runtime_id:-not installed})
+- Runtime         : iOS ${RUNTIME_VERSION} (${runtime_identifier})
+
+Removed if present: Xcode ${LEGACY_XCODE_VERSIONS[*]}, Node ${LEGACY_NODE_VERSIONS[*]}
 
 To use the installed tools in your current shell, run:
   source ~/.zshrc
