@@ -1,0 +1,7 @@
+.superpowers/
+dashboard/hosts.yaml
+dashboard/data/
+node_modules/
+dist/
+dashboard/.env
+.env

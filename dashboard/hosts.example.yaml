@@ -1,0 +1,5 @@
+# Copy to hosts.yaml (gitignored). sshDest: user@ip or an ~/.ssh/config alias.
+hosts:
+  - name: mac-01
+    sshDest: administrator@10.254.20.11
+    tags: [e2e]
