@@ -6,8 +6,6 @@
 
 This script provisions a fresh macOS machine as a GitHub Actions self-hosted runner. It installs and pins Homebrew, Xcode, iOS simulator runtimes, Node.js (via NVM), Ruby (via rbenv), and CocoaPods to exact versions required by the project. The script is idempotent — if it fails mid-way or is run again, it skips steps that are already complete.
 
-Xcode and Node.js are each installed in two versions: a pinned default, plus an additional version installed alongside (not selected as default). This lets workflows that pin an older toolchain and workflows migrating to a newer one both run on the same runner during a transition period.
-
 ### Prerequisites
 
 **Preferred (no Apple auth):** provide a URL to `Xcode_26.0.xip` — for example a presigned S3 URL. The [fleet dashboard](dashboard/) sets this automatically for every bootstrap job:
