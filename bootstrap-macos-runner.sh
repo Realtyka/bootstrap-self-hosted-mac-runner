@@ -15,17 +15,17 @@ NVM_VERSION="v0.40.4"
 # multi-gigabyte download rather than halfway through provisioning.
 REQUIRED_MACOS_VERSION="26.2"
 
-# Simulator pinning.
+# Simulator runtime pinning.
 #
-# The runtime is pinned by MAJOR version only, and the newest installed iOS 26.x
-# is resolved at run time. Apple does not keep simulator runtime versions in step
-# with Xcode minor versions — Xcode 26.6 ships the iOS 26.5 SDK and no "iOS 26.6"
-# runtime exists — so an exact runtime pin would need re-editing on every Xcode
-# bump and would hard-fail whenever the two drift.
-REQUIRED_IOS_SIM_RUNTIME_MAJOR="26"
+# Deliberately NOT pinned here: the required version is the iOS SDK version of
+# the selected Xcode, read off the toolchain at run time (IOS_SDK_VERSION, in
+# the iOS platform section). Apple does not keep runtime versions in step with
+# Xcode minor versions — Xcode 26.6 ships the iOS 26.5 SDK and no "iOS 26.6"
+# runtime exists — so a literal pin would need re-editing on every Xcode bump,
+# and a major-only pin ("any iOS 26.x") is actively harmful; see that section.
 REQUIRED_SIM_DEVICE_TYPE="iPhone 17 Pro"
 # Optional escape hatch if runtime install isn't supported automatically:
-# Provide a local path to a downloaded runtime DMG
+# Provide a local path to a downloaded runtime DMG matching the SDK version
 # Example: export IOS_RUNTIME_DMG_PATH="/path/to/iOS_26.5_Simulator_Runtime.dmg"
 IOS_RUNTIME_DMG_PATH="${IOS_RUNTIME_DMG_PATH:-}"
 
@@ -389,9 +389,30 @@ xcrun simctl list runtimes >/dev/null \
   || die "simctl is broken after removing the superseded Xcode versions"
 
 # ==================================================
-# Simulator runtime + device (iPhone 17 Pro / newest iOS 26.x)
+# iOS platform (device SDK + matching simulator runtime)
 # ==================================================
-log "Ensuring an iOS ${REQUIRED_IOS_SIM_RUNTIME_MAJOR}.x simulator runtime and a '${REQUIRED_SIM_DEVICE_TYPE}' device exist..."
+# This section is not simulator-only housekeeping — it gates device archives.
+# Xcode reports its entire iOS platform as "not installed" unless the simulator
+# runtime matching its own bundled iOS SDK is present, and in that state EVERY
+# iOS destination becomes ineligible, including the "Any iOS Device" placeholder
+# that `xcodebuild archive -destination 'generic/platform=iOS'` resolves to. Such
+# a runner still builds and tests on a simulator, so it looks healthy, but every
+# Fastlane build_app fails with:
+#   error:iOS <ver> is not installed. Please download and install the platform
+#         from Xcode > Settings > Components.
+#
+# Hence the required runtime version is the SDK version of the selected Xcode,
+# resolved here rather than pinned. Matching on the major version alone ("any
+# iOS 26.x") is the specific trap this replaces: CoreSimulator runtimes live
+# under /Library/Developer, outside the Xcode bundle, so they survive an Xcode
+# uninstall (see the check above) — a runtime left behind by a superseded Xcode
+# satisfies a major-only test and silently suppresses the download the newly
+# installed Xcode actually needs.
+IOS_SDK_VERSION="$(xcrun --sdk iphoneos --show-sdk-version 2>/dev/null || true)"
+[[ -n "${IOS_SDK_VERSION}" ]] \
+  || die "Xcode ${REQUIRED_XCODE_VERSION} exposes no iPhoneOS SDK (xcrun --sdk iphoneos failed), so this runner cannot build for iOS at all. Reinstall it:\n  xcodes uninstall ${REQUIRED_XCODE_VERSION} --empty-trash && xcodes install ${REQUIRED_XCODE_VERSION} --select"
+
+log "Ensuring the iOS ${IOS_SDK_VERSION} runtime (the SDK Xcode ${REQUIRED_XCODE_VERSION} builds against) and a '${REQUIRED_SIM_DEVICE_TYPE}' device exist..."
 
 # Ensure the device type exists in this Xcode. Matched against the start of the
 # trailing identifier so "iPhone 17 Pro" cannot be satisfied by a
@@ -400,45 +421,48 @@ if ! xcrun simctl list devicetypes | grep -Fq "${REQUIRED_SIM_DEVICE_TYPE} (com.
   die "Simulator device type '${REQUIRED_SIM_DEVICE_TYPE}' not found in this Xcode. Check Xcode version/components."
 fi
 
-# Resolve the newest installed iOS <major>.x runtime.
-# Prints "<version> <identifier>", or nothing when none is installed.
+# Resolve the installed runtime matching the Xcode iOS SDK version. Runtime
+# display names carry <major>.<minor> even for patch builds ("iOS 26.3 (26.3.1 -
+# 23D8133)"), so the SDK version is matched against the name and anchored on the
+# following space — otherwise 26.5 would also accept a future "iOS 26.50".
+# Prints "<version> <identifier>", or nothing when it is not installed.
 get_runtime_entry() {
   xcrun simctl list runtimes 2>/dev/null \
-    | grep -E "^iOS ${REQUIRED_IOS_SIM_RUNTIME_MAJOR}\.[0-9]" \
+    | grep -E "^iOS ${IOS_SDK_VERSION//./\\.} " \
     | grep -v -i 'unavailable' \
     | sed -E 's/^iOS ([0-9.]+) .* - (com\.apple\.CoreSimulator\.SimRuntime\.[A-Za-z0-9.-]+).*$/\1 \2/' \
-    | sort -V \
-    | tail -n1 || true
+    | head -n1 || true
 }
 
 runtime_entry="$(get_runtime_entry)"
 
 if [[ -z "${runtime_entry}" ]]; then
-  log "No iOS ${REQUIRED_IOS_SIM_RUNTIME_MAJOR}.x runtime installed yet."
+  log "iOS ${IOS_SDK_VERSION} runtime is not installed — Xcode ${REQUIRED_XCODE_VERSION} therefore treats its iOS platform as missing, which breaks device archives as well as simulator builds."
 
   # Primary: xcodebuild -downloadPlatform (Apple's native approach, Xcode 15+).
-  # Fetches the latest iOS platform for the selected Xcode.
-  log "Downloading iOS platform via xcodebuild..."
+  # Fetches the platform matching the selected Xcode, which is exactly the
+  # runtime version resolved above. Runs on every provisioning pass where that
+  # runtime is absent — it must not be reachable only when NO iOS runtime exists.
+  # sudo on purpose: the runtime installs under /Library/Developer, and without
+  # it xcodebuild raises a GUI admin-auth prompt no one answers on a headless
+  # runner. Consistent with -license accept / -runFirstLaunch above.
+  log "Downloading the iOS ${IOS_SDK_VERSION} platform via xcodebuild..."
   set +e
-  xcodebuild -downloadPlatform iOS
+  sudo xcodebuild -downloadPlatform iOS
   set -e
   runtime_entry="$(get_runtime_entry)"
 
-  # Fallback: xcodes runtimes install. It needs an explicit runtime name, so ask
-  # xcodes for the newest iOS <major>.x it offers.
+  # Fallback: xcodes runtimes install, asked for the exact version Xcode wants
+  # rather than the newest on offer — a newer runtime does not satisfy Xcode.
   if [[ -z "${runtime_entry}" ]] && command_exists xcodes; then
-    log "xcodebuild did not yield an iOS ${REQUIRED_IOS_SIM_RUNTIME_MAJOR}.x runtime — falling back to xcodes..."
-    runtime_candidate="$(xcodes runtimes 2>/dev/null \
-      | grep -oE "^iOS ${REQUIRED_IOS_SIM_RUNTIME_MAJOR}\.[0-9.]+" \
-      | sort -V \
-      | tail -n1 || true)"
-    if [[ -n "${runtime_candidate}" ]]; then
+    log "xcodebuild did not yield the iOS ${IOS_SDK_VERSION} runtime — falling back to xcodes..."
+    if xcodes runtimes 2>/dev/null | grep -qE "^iOS ${IOS_SDK_VERSION//./\\.}( |$)"; then
       set +e
-      xcodes runtimes install "${runtime_candidate}"
+      xcodes runtimes install "iOS ${IOS_SDK_VERSION}"
       set -e
       runtime_entry="$(get_runtime_entry)"
     else
-      log "xcodes offered no iOS ${REQUIRED_IOS_SIM_RUNTIME_MAJOR}.x runtime"
+      log "xcodes offers no iOS ${IOS_SDK_VERSION} runtime"
     fi
   fi
 
@@ -450,13 +474,17 @@ if [[ -z "${runtime_entry}" ]]; then
     runtime_entry="$(get_runtime_entry)"
   fi
 
+  # Hard failure on purpose. A runner missing this runtime provisions
+  # "successfully" and then fails every device archive with "iOS
+  # ${IOS_SDK_VERSION} is not installed", so refuse to hand one over rather than
+  # letting the breakage surface later in a release build.
   [[ -n "${runtime_entry}" ]] \
-    || die "Unable to install/find an iOS ${REQUIRED_IOS_SIM_RUNTIME_MAJOR}.x runtime.\nInstalled runtimes:\n$(xcrun simctl list runtimes 2>/dev/null || true)\nInstall one via Xcode > Settings > Platforms, or provide IOS_RUNTIME_DMG_PATH to a runtime DMG."
+    || die "Unable to install the iOS ${IOS_SDK_VERSION} runtime that Xcode ${REQUIRED_XCODE_VERSION} requires. Without it every iOS destination is ineligible and 'xcodebuild archive -destination generic/platform=iOS' fails with \"iOS ${IOS_SDK_VERSION} is not installed\".\nInstalled runtimes:\n$(xcrun simctl list runtimes 2>/dev/null || true)\nInstall it via Xcode > Settings > Components, or provide IOS_RUNTIME_DMG_PATH to the matching runtime DMG."
 fi
 
 RUNTIME_VERSION="${runtime_entry%% *}"
 runtime_identifier="${runtime_entry##* }"
-log "Runtime OK: iOS ${RUNTIME_VERSION} (${runtime_identifier})"
+log "Runtime OK: iOS ${RUNTIME_VERSION} (${runtime_identifier}) — matches the iOS ${IOS_SDK_VERSION} SDK, so the iOS platform is complete and device archives can resolve 'generic/platform=iOS'"
 
 # Boot the default simulator once to warm it up. Scoped to the resolved runtime's
 # section of `simctl list devices`, and anchored on "<device type> (" so the
@@ -700,6 +728,7 @@ Locked versions:
 - CocoaPods       : ${ACTUAL_COCOAPODS_VERSION}
 - applesimutils   : $(applesimutils --version 2>/dev/null || echo "installed")
 - Simulator       : ${REQUIRED_SIM_DEVICE_TYPE} (${default_udid:-none})
+- iOS SDK         : ${IOS_SDK_VERSION}
 - Runtime         : iOS ${RUNTIME_VERSION} (${runtime_identifier})
 
 Removed if present: Xcode ${LEGACY_XCODE_VERSIONS[*]}, Node ${LEGACY_NODE_VERSIONS[*]}
