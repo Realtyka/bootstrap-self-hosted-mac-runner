@@ -414,12 +414,16 @@ IOS_SDK_VERSION="$(xcrun --sdk iphoneos --show-sdk-version 2>/dev/null || true)"
 
 log "Ensuring the iOS ${IOS_SDK_VERSION} runtime (the SDK Xcode ${REQUIRED_XCODE_VERSION} builds against) and a '${REQUIRED_SIM_DEVICE_TYPE}' device exist..."
 
-# Ensure the device type exists in this Xcode. Matched against the start of the
-# trailing identifier so "iPhone 17 Pro" cannot be satisfied by a
-# "iPhone 17 Pro Max" row.
-if ! xcrun simctl list devicetypes | grep -Fq "${REQUIRED_SIM_DEVICE_TYPE} (com.apple."; then
-  die "Simulator device type '${REQUIRED_SIM_DEVICE_TYPE}' not found in this Xcode. Check Xcode version/components."
-fi
+# Ensure the device type exists in this Xcode, and capture its identifier — the
+# device creation below needs the identifier, not the display name. Anchored on
+# the whole line so "iPhone 17 Pro" cannot be satisfied by an "iPhone 17 Pro Max"
+# row. `sed -n …p` rather than the `;t;d` idiom: BSD sed rejects a label that is
+# not the last thing on its line, so `;t;d` fails with "undefined label" here.
+SIM_DEVICE_TYPE_ID="$(xcrun simctl list devicetypes 2>/dev/null \
+  | sed -E -n "s/^${REQUIRED_SIM_DEVICE_TYPE} \((com\.apple\.CoreSimulator\.SimDeviceType\.[^)]+)\)$/\1/p" \
+  | head -n1 || true)"
+[[ -n "${SIM_DEVICE_TYPE_ID}" ]] \
+  || die "Simulator device type '${REQUIRED_SIM_DEVICE_TYPE}' not found in this Xcode. Check Xcode version/components."
 
 # Resolve the installed runtime matching the Xcode iOS SDK version. Runtime
 # display names carry <major>.<minor> even for patch builds ("iOS 26.3 (26.3.1 -
@@ -565,27 +569,50 @@ log "Removing simulator devices left without a runtime..."
 xcrun simctl delete unavailable </dev/null \
   || log "Warning: 'simctl delete unavailable' failed; stale device data remains under ~/Library/Developer/CoreSimulator/Devices"
 
-# Boot the default simulator once to warm it up. Scoped to the resolved runtime's
-# section of `simctl list devices`, and anchored on "<device type> (" so the
+# UDID of the pinned device on the resolved runtime. Scoped to that runtime's
+# section of `simctl list devices`, so a device of the same type on some other
+# runtime cannot be mistaken for it, and anchored on "<device type> (" so the
 # lookup cannot drift onto a "... Pro Max" device.
-default_udid="$(xcrun simctl list devices 2>/dev/null \
-  | awk -v want="-- iOS ${RUNTIME_VERSION} --" '
-      /^-- / { in_section = ($0 == want); next }
-      in_section { print }
-    ' \
-  | grep -E "^[[:space:]]*${REQUIRED_SIM_DEVICE_TYPE} \(" \
-  | grep -oE '[0-9A-Fa-f]{8}-([0-9A-Fa-f]{4}-){3}[0-9A-Fa-f]{12}' \
-  | head -n1 || true)"
+get_default_udid() {
+  xcrun simctl list devices 2>/dev/null \
+    | awk -v want="-- iOS ${RUNTIME_VERSION} --" '
+        /^-- / { in_section = ($0 == want); next }
+        in_section { print }
+      ' \
+    | grep -E "^[[:space:]]*${REQUIRED_SIM_DEVICE_TYPE} \(" \
+    | grep -oE '[0-9A-Fa-f]{8}-([0-9A-Fa-f]{4}-){3}[0-9A-Fa-f]{12}' \
+    | head -n1 || true
+}
 
-if [[ -n "${default_udid}" ]]; then
-  log "Warming up simulator: ${REQUIRED_SIM_DEVICE_TYPE} (${default_udid})..."
-  xcrun simctl boot "${default_udid}" || true
-  xcrun simctl bootstatus "${default_udid}" -b
-  xcrun simctl shutdown "${default_udid}" || true
-  log "Simulator ready: ${default_udid}"
-else
-  log "Warning: No ${REQUIRED_SIM_DEVICE_TYPE} simulator found for iOS ${RUNTIME_VERSION}"
+default_udid="$(get_default_udid)"
+
+# Create the device when it is absent rather than warning and moving on. Xcode
+# seeds a default device set when it installs a runtime, but that set does not
+# survive everything: `simctl delete unavailable` above reclaims devices stranded
+# by a runtime removal, and an operator clearing simulators by hand leaves the
+# same hole. Warning here used to hand back a runner that provisioned
+# "successfully" with nothing to boot — the same failure shape as the missing
+# platform this script now guards against, so it is a hard failure instead.
+if [[ -z "${default_udid}" ]]; then
+  log "No ${REQUIRED_SIM_DEVICE_TYPE} device on iOS ${RUNTIME_VERSION} — creating one..."
+  xcrun simctl create "${REQUIRED_SIM_DEVICE_TYPE}" "${SIM_DEVICE_TYPE_ID}" "${runtime_identifier}" </dev/null \
+    || die "Could not create a '${REQUIRED_SIM_DEVICE_TYPE}' simulator on iOS ${RUNTIME_VERSION}. Create it manually and re-run:\n  xcrun simctl create '${REQUIRED_SIM_DEVICE_TYPE}' ${SIM_DEVICE_TYPE_ID} ${runtime_identifier}"
+
+  # Re-resolved through the runtime-scoped lookup rather than trusting the UDID
+  # `simctl create` prints: that also proves the device landed on the runtime this
+  # runner builds against.
+  default_udid="$(get_default_udid)"
+  [[ -n "${default_udid}" ]] \
+    || die "'simctl create' succeeded but no '${REQUIRED_SIM_DEVICE_TYPE}' device appears under iOS ${RUNTIME_VERSION}.\n$(xcrun simctl list devices 2>/dev/null || true)"
+  log "Created ${REQUIRED_SIM_DEVICE_TYPE} on iOS ${RUNTIME_VERSION}: ${default_udid}"
 fi
+
+# Boot once to warm it up, then leave it shut down as it was found.
+log "Warming up simulator: ${REQUIRED_SIM_DEVICE_TYPE} (${default_udid})..."
+xcrun simctl boot "${default_udid}" || true
+xcrun simctl bootstatus "${default_udid}" -b
+xcrun simctl shutdown "${default_udid}" || true
+log "Simulator ready: ${default_udid}"
 
 # ==================================================
 # 2) NVM + Node.js (official installer)
