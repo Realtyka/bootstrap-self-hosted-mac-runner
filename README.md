@@ -8,6 +8,8 @@ A single pinned Xcode is installed and selected as the system default. Supersede
 
 **macOS 26.2 or later.** Xcode 26.4 raised the minimum from macOS 15.6, so a runner on an older macOS cannot run the pinned Xcode. The script checks this up front and fails before downloading anything.
 
+**Nothing else.** The Command Line Tools (`git`, `clang`) are installed non-interactively via `softwareupdate` as the very first step, before Homebrew. This matters on a host that already has Homebrew from some other source: the script skips the Homebrew installer when `brew` exists, and that installer is normally what pulls the Command Line Tools in, so without this step such a host reaches `brew update` with no working `git` at all.
+
 ### Prerequisites
 
 If Xcode is not already installed, the script uses [xcodes](https://github.com/XcodesOrg/xcodes) to download and install it. This requires an Apple ID. Export the following environment variables before running the script:

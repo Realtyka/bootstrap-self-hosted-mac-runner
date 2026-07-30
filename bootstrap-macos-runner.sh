@@ -47,6 +47,44 @@ version_gte() {
 }
 
 # ==================================================
+# Command Line Tools helpers
+# ==================================================
+# Every developer shim in /usr/bin (git, clang, xcodebuild, xcrun) resolves
+# through the active developer directory. With none set they all fail with
+# "No developer tools were found, requesting install." — which is how a runner
+# ends up with a Homebrew that can never run `brew update`.
+developer_dir_is_usable() {
+  local dir
+  dir="$(/usr/bin/xcode-select -p 2>/dev/null)" || return 1
+  [[ -n "${dir}" && -d "${dir}" ]] || return 1
+  /usr/bin/git --version >/dev/null 2>&1
+}
+
+# Headless CLT install. `xcode-select --install` is deliberately NOT used: it
+# opens a GUI dialog nobody can click on an unattended runner. softwareupdate
+# only offers the CLT package while the sentinel file exists — that pairing is
+# the long-standing non-interactive route.
+install_command_line_tools() {
+  local sentinel="/tmp/.com.apple.dt.CommandLineTools.installondemand.in-progress"
+  local label rc=0
+  sudo touch "${sentinel}"
+  # Newest label wins: several "Command Line Tools for Xcode-<ver>" rows can be
+  # offered at once, and sort -V orders them by version rather than by the order
+  # softwareupdate happens to print them in.
+  label="$(softwareupdate -l 2>/dev/null \
+           | awk -F'Label: ' '/Label: Command Line Tools/ {print $2}' \
+           | sort -V | tail -n1)"
+  if [[ -n "${label}" ]]; then
+    log "Installing ${label} (this takes a few minutes)..."
+    sudo softwareupdate -i "${label}" --verbose || rc=1
+  else
+    rc=1
+  fi
+  sudo rm -f "${sentinel}"
+  return "${rc}"
+}
+
+# ==================================================
 # Xcode uninstall helpers
 # ==================================================
 # `xcodes installed <version>` is the only non-interactive presence probe: it
@@ -146,6 +184,40 @@ version_gte "${MACOS_VERSION}" "${REQUIRED_MACOS_VERSION}" \
 log "macOS OK: ${MACOS_VERSION}"
 
 # ==================================================
+# 0) Command Line Tools (git, clang) — BEFORE Homebrew
+# ==================================================
+# Ordering is load-bearing. Homebrew's own installer normally drags the CLT in,
+# but the Homebrew step below skips that installer whenever brew already exists,
+# so a runner that acquired Homebrew by any other route (tarball, restored disk
+# image, another provisioning script) reaches `brew update` with no git at all.
+#
+# CLT rather than Xcode is the right early dependency: it supplies git and clang
+# on a virgin box, installs unattended, and needs neither an Apple ID nor a 12 GB
+# download. Xcode cannot go first — `xcodes` is installed into $(brew --prefix)/bin,
+# so Homebrew necessarily precedes it.
+log "Ensuring Command Line Tools (git, clang)..."
+if ! developer_dir_is_usable; then
+  # Common on a runner whose selected Xcode was deleted out from under
+  # xcode-select: the CLT are on disk but nothing points at them.
+  if [[ -x /Library/Developer/CommandLineTools/usr/bin/git ]]; then
+    log "Command Line Tools present but not active — selecting them"
+    sudo xcode-select -s /Library/Developer/CommandLineTools
+  fi
+  if ! developer_dir_is_usable; then
+    install_command_line_tools \
+      || die "Could not install the Command Line Tools automatically. Run 'xcode-select --install' on this host, finish the dialog, then re-run this script."
+    if ! developer_dir_is_usable && [[ -x /Library/Developer/CommandLineTools/usr/bin/git ]]; then
+      sudo xcode-select -s /Library/Developer/CommandLineTools
+    fi
+  fi
+  developer_dir_is_usable \
+    || die "Command Line Tools still unusable after install. git is required before Homebrew can run."
+fi
+# Only ever reached without touching an already-valid selection, so a runner that
+# already has an Xcode selected keeps it — the Xcode step below owns that choice.
+log "Developer tools OK: $(/usr/bin/xcode-select -p) ($(/usr/bin/git --version))"
+
+# ==================================================
 # 1) Homebrew (official installer)
 # ==================================================
 log "Ensuring Homebrew is installed..."
@@ -158,7 +230,17 @@ elif [[ -x /usr/local/bin/brew ]]; then
 fi
 
 if ! command_exists brew; then
-  /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+  log "Installing Homebrew..."
+  # Fetched to a file rather than `bash -c "$(curl ...)"`: with -f -s a failed
+  # fetch prints nothing and expands to the empty string, so `bash -c ""` exits 0
+  # and the run sails on to `brew update` as though Homebrew had been installed.
+  HOMEBREW_INSTALLER="$(mktemp -t homebrew-install)"
+  curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh \
+    -o "${HOMEBREW_INSTALLER}" \
+    || die "Could not download the Homebrew installer from raw.githubusercontent.com."
+  [[ -s "${HOMEBREW_INSTALLER}" ]] || die "Homebrew installer downloaded empty."
+  /bin/bash "${HOMEBREW_INSTALLER}"
+  rm -f "${HOMEBREW_INSTALLER}"
   # Set up PATH after fresh install
   if [[ -x /opt/homebrew/bin/brew ]]; then
     eval "$(/opt/homebrew/bin/brew shellenv)"
@@ -169,7 +251,20 @@ if ! command_exists brew; then
   fi
 fi
 
-brew update
+# Best effort, never fatal. `brew update` hard-fails on a Homebrew that has no
+# git repository — `brew config` reports "shallow or no git repository" — and it
+# exits 1 printing NOTHING at all, so under `set -e` it killed the entire run
+# with a blank screen and no diagnostic. Homebrew 4.x resolves formulae from the
+# JSON API and refreshes that index during `brew install`, so the only cost of a
+# skipped update is slightly staler metadata.
+BREW_UPDATE_RC=0
+brew update || BREW_UPDATE_RC=$?
+if (( BREW_UPDATE_RC != 0 )); then
+  log "Warning: 'brew update' exited ${BREW_UPDATE_RC} — continuing with the JSON API package index"
+  if [[ ! -d "$(brew --repository)/.git" ]]; then
+    log "  Cause: $(brew --repository) has no git repository, so 'brew update' can never succeed on this host. Reinstall Homebrew with the official installer to restore it."
+  fi
+fi
 
 # ==================================================
 # Xcode install (skip xcodes if already present)
