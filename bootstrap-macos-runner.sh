@@ -434,6 +434,20 @@ get_runtime_entry() {
     | head -n1 || true
 }
 
+# Build identifier of that runtime ("23F77"). The build is the only key shared by
+# `simctl list runtimes` and `simctl runtime list`, and the cleanup below needs
+# it: the two commands disagree on the version column for patch releases, where a
+# runtime `simctl list runtimes` names "iOS 26.3" appears as "iOS 26.3.1" in
+# `simctl runtime list`. Matching those on version would fail to recognise the
+# required image and delete it.
+get_runtime_build() {
+  xcrun simctl list runtimes 2>/dev/null \
+    | grep -E "^iOS ${IOS_SDK_VERSION//./\\.} " \
+    | grep -v -i 'unavailable' \
+    | sed -E 's/^iOS [0-9.]+ \([0-9.]+ - ([0-9A-Za-z]+)\).*$/\1/' \
+    | head -n1 || true
+}
+
 runtime_entry="$(get_runtime_entry)"
 
 if [[ -z "${runtime_entry}" ]]; then
@@ -484,7 +498,72 @@ fi
 
 RUNTIME_VERSION="${runtime_entry%% *}"
 runtime_identifier="${runtime_entry##* }"
+RUNTIME_BUILD="$(get_runtime_build)"
 log "Runtime OK: iOS ${RUNTIME_VERSION} (${runtime_identifier}) — matches the iOS ${IOS_SDK_VERSION} SDK, so the iOS platform is complete and device archives can resolve 'generic/platform=iOS'"
+
+# ==================================================
+# Remove superseded simulator runtimes and stranded devices
+# ==================================================
+# Nothing else reclaims these. Runtime disk images are ~8 GB each and live under
+# /Library/Developer/CoreSimulator, outside the Xcode bundle, so the image an
+# uninstalled Xcode pulled in stays on disk forever; only the image matching the
+# selected Xcode's SDK is ever used for a build, so the rest is dead weight that
+# accumulates with every Xcode bump. Devices are worse: each keeps its data
+# directory under ~/Library/Developer/CoreSimulator/Devices whether or not its
+# runtime still exists.
+#
+# Deliberately placed after the required runtime is confirmed present, for the
+# same reason the strict Xcode uninstall pass waits for Xcode
+# ${REQUIRED_XCODE_VERSION} to be selected: never remove the old thing before the
+# new one is proven. Warns rather than dies throughout — wasted disk does not make
+# the provisioned toolchain wrong, and failing here would block a runner that is
+# otherwise ready to serve jobs.
+if [[ -z "${RUNTIME_BUILD}" ]]; then
+  log "Warning: could not read the build of the iOS ${RUNTIME_VERSION} runtime, so superseded images cannot be told apart from the one this runner needs — skipping runtime cleanup rather than risk deleting the wrong image. Inspect and reclaim manually:\n  xcrun simctl runtime list"
+else
+  log "Removing superseded iOS simulator runtimes (keeping iOS ${RUNTIME_VERSION} build ${RUNTIME_BUILD})..."
+
+  # Scoped to the "-- iOS --" section so watchOS/tvOS/visionOS images — which this
+  # script does not manage — are left alone, and to rows starting "iOS " so the
+  # trailing "Total Disk Images:" summary line is not mistaken for an entry.
+  superseded_runtimes="$(xcrun simctl runtime list 2>/dev/null \
+    | awk '
+        /^== / { in_ios = 0; next }
+        /^-- / { in_ios = ($0 == "-- iOS --"); next }
+        in_ios && /^iOS / { print }
+      ' \
+    | sed -E 's/^iOS ([0-9.]+) \(([0-9A-Za-z]+)\) - ([0-9A-Fa-f-]{36}).*$/\1 \2 \3/' \
+    | grep -v " ${RUNTIME_BUILD} " || true)"
+
+  if [[ -z "${superseded_runtimes}" ]]; then
+    log "No superseded iOS runtime images on disk"
+  else
+    while read -r _rt_version _rt_build _rt_uuid; do
+      # An unparsed row must never reach `runtime delete` with a garbage
+      # argument, so require the image UUID to look like one.
+      if [[ ! "${_rt_uuid}" =~ ^[0-9A-Fa-f-]{36}$ ]]; then
+        log "  Warning: could not parse runtime row '${_rt_version} ${_rt_build} ${_rt_uuid}' — skipping"
+        continue
+      fi
+      log "  Deleting iOS ${_rt_version} (${_rt_build})..."
+      # </dev/null twice over: it stops any auth prompt from hanging a headless
+      # runner, and stops the command from consuming this loop's input.
+      xcrun simctl runtime delete "${_rt_uuid}" </dev/null \
+        || log "  Warning: could not delete iOS ${_rt_version} (${_rt_build}). Reclaim it manually:\n    xcrun simctl runtime delete ${_rt_uuid}"
+    done <<< "${superseded_runtimes}"
+    unset _rt_version _rt_build _rt_uuid
+  fi
+
+  log "Runtime images remaining: $(xcrun simctl runtime list 2>/dev/null | grep -E '^Total Disk Images:' || echo 'unknown')"
+fi
+
+# Sweeps devices whose runtime no longer exists: the images just deleted, plus
+# anything stranded earlier by the superseded Xcode removals. They cannot boot, so
+# their data directories are pure waste. Runs before the warm-up below so the
+# device lookup there cannot land on one of them.
+log "Removing simulator devices left without a runtime..."
+xcrun simctl delete unavailable </dev/null \
+  || log "Warning: 'simctl delete unavailable' failed; stale device data remains under ~/Library/Developer/CoreSimulator/Devices"
 
 # Boot the default simulator once to warm it up. Scoped to the resolved runtime's
 # section of `simctl list devices`, and anchored on "<device type> (" so the
