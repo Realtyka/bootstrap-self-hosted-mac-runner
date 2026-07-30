@@ -30,9 +30,15 @@ If Xcode is already installed at the required version, these variables are not n
 | Yarn | via Corepack shim (version comes from each repo's `packageManager`) |
 | Ruby | 3.1.2 |
 | CocoaPods | 1.16.2 |
-| iOS Simulator | newest iOS 26.x runtime (iPhone 17 Pro) |
+| iOS Simulator | runtime matching the Xcode iOS SDK — 26.5 for Xcode 26.6 (iPhone 17 Pro) |
 
-The simulator runtime is pinned by major version only. Apple does not keep runtime versions in step with Xcode minor versions — Xcode 26.6 ships the iOS 26.5 SDK and no "iOS 26.6" runtime exists — so the script resolves the newest installed iOS 26.x runtime at run time instead of hardcoding a minor that would drift.
+The simulator runtime version is not hardcoded: the script reads the selected Xcode's iOS SDK version (`xcrun --sdk iphoneos --show-sdk-version`) and requires exactly that runtime. Apple does not keep runtime versions in step with Xcode minor versions — Xcode 26.6 ships the iOS 26.5 SDK and no "iOS 26.6" runtime exists — so a hardcoded minor would drift on every Xcode bump.
+
+The pinned `iPhone 17 Pro` device is created on that runtime if it is missing — a hole `simctl delete unavailable` or a manual simulator purge can leave — and the script fails rather than handing back a runner with nothing to boot.
+
+Once the required runtime is confirmed present, the script deletes every other iOS runtime disk image (~8 GB each) and then runs `simctl delete unavailable` to drop devices whose runtime no longer exists. Nothing else reclaims these: runtime images live outside the Xcode bundle, so the one an uninstalled Xcode pulled in would otherwise sit on disk forever, along with the data directory of every device stranded on it. Only iOS images are touched — watchOS/tvOS/visionOS are left alone — and the required image is identified by build number, not version, because `simctl list runtimes` and `simctl runtime list` disagree on the version column for patch releases.
+
+Matching the version exactly matters beyond the simulator: Xcode reports its whole iOS platform as *not installed* unless the runtime matching its SDK is present, and that makes every iOS destination ineligible — including the `Any iOS Device` placeholder behind `xcodebuild archive -destination 'generic/platform=iOS'`. A runner with only a mismatched runtime (say iOS 26.0 left behind by a superseded Xcode) still builds and tests on a simulator, so it looks healthy, while every Fastlane device build fails with `iOS 26.5 is not installed. Please download and install the platform from Xcode > Settings > Components.` The script installs the matching runtime via `sudo xcodebuild -downloadPlatform iOS` and hard-fails if it cannot, rather than handing over a runner that can only build for the simulator.
 
 ### Usage
 
