@@ -755,9 +755,15 @@ log "applesimutils OK"
 # ==================================================
 log "Ensuring rbenv and Ruby ${REQUIRED_RUBY_VERSION}..."
 
+# openssl is deliberately NOT bundled into this invocation. openssl@1.1 was
+# disabled in Homebrew on 2024-10-24 (EOL upstream), so on any machine that does
+# not already have it the formula cannot be installed at all — and pairing it
+# with rbenv/ruby-build here risks taking them down with it, leaving the
+# `rbenv init` below with no rbenv to run. Resolved separately at build time.
 if ! command_exists rbenv; then
   log "Installing rbenv and ruby-build..."
-  brew install rbenv ruby-build openssl@1.1 || true
+  brew install rbenv ruby-build \
+    || die "Could not install rbenv/ruby-build via Homebrew."
 else
   log "rbenv already installed — skipping brew install"
 fi
@@ -766,13 +772,133 @@ export PATH="$HOME/.rbenv/shims:$HOME/.rbenv/bin:$PATH"
 eval "$(rbenv init - bash)"
 rbenv rehash 2>/dev/null || true
 
-if ! rbenv versions --bare | grep -Fxq "${REQUIRED_RUBY_VERSION}"; then
-  log "Installing Ruby ${REQUIRED_RUBY_VERSION} (this may take a while)..."
-  OPENSSL_DIR="$(brew --prefix openssl@1.1)"
-  RUBY_CONFIGURE_OPTS="--with-openssl-dir=${OPENSSL_DIR} --disable-shared" \
-    rbenv install "${REQUIRED_RUBY_VERSION}"
+# Prefer openssl@1.1 where a runner still has it, so existing machines keep
+# building exactly what they built before; fall back to openssl@3 (which Ruby
+# 3.1 supports) because a freshly imaged runner can no longer obtain the
+# disabled formula. Deliberately NOT a bare `OPENSSL_DIR="$(brew --prefix
+# openssl@1.1)"`: that exits non-zero for a formula that is not installed, and
+# under `set -e` a failed command substitution in an assignment killed the whole
+# run mid-provision.
+resolve_openssl_dir() {
+  local dir
+  if dir="$(brew --prefix openssl@1.1 2>/dev/null)" && [[ -d "${dir}" ]]; then
+    printf '%s\n' "${dir}"
+    return 0
+  fi
+  brew list --formula openssl@3 >/dev/null 2>&1 || brew install openssl@3 >/dev/null 2>&1 || true
+  if dir="$(brew --prefix openssl@3 2>/dev/null)" && [[ -d "${dir}" ]]; then
+    printf '%s\n' "${dir}"
+    return 0
+  fi
+  return 1
+}
+
+# Ruby 3.0.x and 3.1.x hardcode a path that no longer exists in
+# ext/socket/extconf.rb:
+#
+#   in6 = File.read("/usr/include/#{hdr}")
+#
+# macOS 26 ships no /usr/include at all — the system headers live only inside
+# the active SDK — so that read raises and extconf.rb aborts:
+#
+#   fixing apple's netinet6/in6.h ...*** extconf.rb failed ***
+#   No such file or directory @ rb_sysopen - /usr/include/netinet6/in6.h
+#
+# A failed extension is NOT fatal to a Ruby build: `make install` still succeeds
+# and `rbenv install` still exits 0, so the runner ends up with a Ruby that
+# reports the right version from `ruby -v` but has no socket extension. Every
+# `gem install` then dies with "cannot load such file -- socket" (followed by a
+# red-herring "undefined method `deprecated?' for nil:NilClass" as RubyGems' own
+# error handler crashes), which is how this surfaced — CocoaPods refusing to
+# install on an otherwise healthy-looking runner.
+#
+# Ruby 3.2 fixed this upstream by resolving the header's real location instead
+# of hardcoding it; the patch below is a backport. It is applied only to
+# versions that still carry the bug: 3.1.7, the FINAL 3.1 release, still has it,
+# so no 3.1.x builds on macOS 26 without this. The pin itself is not a free
+# choice — real-app's .ruby-version requires ${REQUIRED_RUBY_VERSION}.
+#
+# Note this only affects BUILDING on macOS 26. A Ruby ${REQUIRED_RUBY_VERSION}
+# compiled on an older macOS keeps working after an OS upgrade, which is why
+# runners provisioned before macOS 26 are unaffected.
+write_ruby_socket_sdk_patch() {
+  cat >"$1" <<'RUBY_SOCKET_SDK_PATCH'
+--- a/ext/socket/extconf.rb
++++ b/ext/socket/extconf.rb
+@@ -660,7 +660,17 @@
+ int t(struct in6_addr *addr) {return IN6_IS_ADDR_UNSPECIFIED(addr);}
+ SRC
+     print "fixing apple's netinet6/in6.h ..."; $stdout.flush
+-    in6 = File.read("/usr/include/#{hdr}")
++    # macOS 26 ships no /usr/include at all: the system headers live only inside
++    # the active SDK, so the hardcoded path this replaces aborted extconf with
++    # ENOENT and silently dropped the entire socket extension from the build.
++    # Ruby 3.2 removed the same hardcoding upstream; this is a backport of it.
++    # Falling back to "" (rather than raising) lands in the "not needed" branch,
++    # which is exactly how Ruby 3.2+ behaves on a modern SDK.
++    in6_sdk = (IO.popen(%w[xcrun --show-sdk-path], err: IO::NULL, &:read).to_s.strip rescue "")
++    in6_path = ["/usr/include/#{hdr}",
++                (in6_sdk.empty? ? nil : File.join(in6_sdk, "usr/include", hdr))
++               ].compact.find {|path| File.exist?(path)}
++    in6 = in6_path ? File.read(in6_path) : ""
+     if in6.gsub!(/\*\(const\s+__uint32_t\s+\*\)\(const\s+void\s+\*\)\(&(\(\w+\))->s6_addr\[(\d+)\]\)/) do
+         i, r = $2.to_i.divmod(4)
+         if r.zero?
+RUBY_SOCKET_SDK_PATCH
+}
+
+# Presence proves nothing (see above): a Ruby whose C extensions failed to build
+# still satisfies both `rbenv versions` and `ruby -v`, which is why the previous
+# version-only gate declared a broken install healthy and skipped the rebuild on
+# every subsequent run. Probe what gem, bundler and CocoaPods actually need.
+#
+# Deliberately NOT probing `json` or other default *gems*: those can be shadowed
+# by a same-named gem from an unrelated GEM_HOME, producing a load failure that
+# says nothing about this Ruby.
+ruby_install_is_healthy() {
+  local prefix="$1"
+  [[ -x "${prefix}/bin/ruby" ]] || return 1
+  "${prefix}/bin/ruby" -e 'require "socket"; require "openssl"; require "zlib"; require "psych"' \
+    >/dev/null 2>&1
+}
+
+RUBY_PREFIX="$(rbenv root)/versions/${REQUIRED_RUBY_VERSION}"
+
+if [[ ! -d "${RUBY_PREFIX}" ]]; then
+  log "Ruby ${REQUIRED_RUBY_VERSION} is not installed"
+  RUBY_NEEDS_BUILD=true
+elif ruby_install_is_healthy "${RUBY_PREFIX}"; then
+  log "Ruby ${REQUIRED_RUBY_VERSION} already installed and healthy — skipping build"
+  RUBY_NEEDS_BUILD=false
 else
-  log "Ruby ${REQUIRED_RUBY_VERSION} already installed via rbenv — skipping build"
+  log "Ruby ${REQUIRED_RUBY_VERSION} is installed but cannot load its core C extensions — rebuilding.\n  This is the state that makes every 'gem install' fail with \"cannot load such file -- socket\"."
+  RUBY_NEEDS_BUILD=true
+fi
+
+if [[ "${RUBY_NEEDS_BUILD}" == true ]]; then
+  OPENSSL_DIR="$(resolve_openssl_dir)" \
+    || die "Could not resolve an OpenSSL prefix via Homebrew (tried openssl@1.1, then openssl@3). Ruby ${REQUIRED_RUBY_VERSION} cannot be built without one."
+  log "Building Ruby ${REQUIRED_RUBY_VERSION} against OpenSSL at ${OPENSSL_DIR} (this may take a while)..."
+
+  # --force rebuilds over the existing (broken) install rather than uninstalling
+  # first. ruby-build only runs `make install` after a successful compile, so a
+  # failed rebuild leaves whatever is already there untouched; uninstalling
+  # first would strand the runner with no Ruby at all if the build then failed.
+  if version_gte "${REQUIRED_RUBY_VERSION}" "3.2.0"; then
+    RUBY_CONFIGURE_OPTS="--with-openssl-dir=${OPENSSL_DIR} --disable-shared" \
+      rbenv install --force "${REQUIRED_RUBY_VERSION}"
+  else
+    RUBY_SOCKET_PATCH="$(mktemp -t ruby-socket-sdk)"
+    write_ruby_socket_sdk_patch "${RUBY_SOCKET_PATCH}"
+    # ruby-build reads the patch from stdin and selects -p1 itself, because the
+    # diff uses a/ and b/ prefixes.
+    RUBY_CONFIGURE_OPTS="--with-openssl-dir=${OPENSSL_DIR} --disable-shared" \
+      rbenv install --force --patch "${REQUIRED_RUBY_VERSION}" <"${RUBY_SOCKET_PATCH}"
+    rm -f "${RUBY_SOCKET_PATCH}"
+  fi
+
+  ruby_install_is_healthy "${RUBY_PREFIX}" \
+    || die "Ruby ${REQUIRED_RUBY_VERSION} built but still cannot load its core C extensions, so every 'gem install' would fail.\n  Find the extension that failed to configure:\n    grep -il 'could not be configured' ${RUBY_PREFIX}/lib/ruby/${REQUIRED_RUBY_VERSION%.*}.0/*/mkmf.log"
 fi
 
 rbenv global "${REQUIRED_RUBY_VERSION}"
@@ -797,7 +923,13 @@ fi
 ACTUAL_RUBY_VERSION="$(ruby -v | awk '{print $2}')"
 [[ "${ACTUAL_RUBY_VERSION}" == "${REQUIRED_RUBY_VERSION}"* ]] \
   || die "Ruby runtime mismatch: expected ${REQUIRED_RUBY_VERSION}, got ${ACTUAL_RUBY_VERSION}"
-log "Ruby OK: ${ACTUAL_RUBY_VERSION}"
+
+# Re-probed through the shim rather than reusing the ${RUBY_PREFIX} result
+# above, so this proves the Ruby the runner will actually resolve can load its
+# extensions — the prefix check cannot catch a shim pointing somewhere else.
+ruby -e 'require "socket"; require "openssl"; require "zlib"; require "psych"' >/dev/null 2>&1 \
+  || die "Ruby ${ACTUAL_RUBY_VERSION} is active but cannot load its core C extensions, so every 'gem install' would fail with \"cannot load such file -- socket\"."
+log "Ruby OK: ${ACTUAL_RUBY_VERSION} (socket, openssl, zlib, psych all load)"
 
 # ==================================================
 # 5) CocoaPods (exact version)
